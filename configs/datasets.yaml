@@ -1,0 +1,68 @@
+# Dataset registry: identity + durable Hugging Face locations only.
+# Dataset-specific filtering belongs in configs/stage1, stage2 and stage3.
+datasets:
+  fineweb_edu:
+    source:
+      repo_id: "HuggingFaceFW/fineweb_edu_100BT-shuffled"
+      revision: "main"
+      format: "parquet"
+      glob_patterns:
+        - "**/*.parquet"
+        - "*.parquet"
+    repos:
+      stage1: "dignity045/laughlm-fineweb-edu-stage1"
+      stage2: "dignity045/laughlm-fineweb-edu-stage2"
+      stage3: "dignity045/laughlm-fineweb-edu-hq"
+
+  finepdfs_edu:
+    source:
+      repo_id: "HuggingFaceFW/finepdfs-edu"
+      revision: "main"
+      format: "parquet"
+      # English data lives under eng_Latn in the current HF layout.
+      glob_patterns:
+        - "data/eng_Latn/**/*.parquet"
+        - "data/eng_Latn/*.parquet"
+    repos:
+      stage1: "dignity045/laughlm-finepdfs-edu-stage1"
+      stage2: "dignity045/laughlm-finepdfs-edu-stage2"
+      stage3: "dignity045/laughlm-finepdfs-edu-hq"
+
+  finemath:
+    source:
+      repo_id: "HuggingFaceTB/finemath"
+      revision: "main"
+      format: "parquet"
+      # Narrow this in the Stage-1 config if you only want FineMath-4+.
+      glob_patterns:
+        - "**/*.parquet"
+        - "*.parquet"
+    repos:
+      stage1: "dignity045/laughlm-finemath-stage1"
+      stage2: "dignity045/laughlm-finemath-stage2"
+      stage3: "dignity045/laughlm-finemath-hq"
+
+  stack_edu:
+    source:
+      repo_id: "HuggingFaceTB/stack-edu"
+      revision: "main"
+      format: "parquet"
+      glob_patterns:
+        - "**/*.parquet"
+        - "*.parquet"
+    repos:
+      stage1: "dignity045/laughlm-stack-edu-stage1"
+      stage2: "dignity045/laughlm-stack-edu-stage2"
+      stage3: "dignity045/laughlm-stack-edu-hq"
+
+  dolma3_150b:
+    source:
+      repo_id: "allenai/dolma3_mix-150B-1025"
+      revision: "main"
+      format: "jsonl_zst"
+      glob_patterns:
+        - "data/**/*.jsonl.zst"
+    repos:
+      stage1: "dignity045/laughlm-dolma3-150b-stage1"
+      stage2: "dignity045/laughlm-dolma3-150b-stage2"
+      stage3: "dignity045/laughlm-dolma3-150b-hq"

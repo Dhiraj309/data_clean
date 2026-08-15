@@ -1,0 +1,29 @@
+stage: 2
+dataset: finepdfs_edu
+dedup_namespace: "laughlm-hq-v1"
+stage1_config: "../stage1/finepdfs_edu.yaml"
+text_column: text
+id_column: id
+cleaning: {use_trafilatura: false, use_ftfy: false, symbol_lines_to_remove: []}
+custom_filters:
+  - name: normalize_whitespace
+    kwargs: {max_blank_lines: 2, strip: true}
+  - name: length_filter
+    kwargs: {min_chars: 500, max_chars: 1500000}
+datatrove_quality_filters: []
+# FinePDFs-Edu already performs PII anonymization upstream; keep this off unless audit says otherwise.
+pii: {enabled: false, kwargs: {}}
+output_metadata_fields:
+  - token_count
+  - language
+  - page_average_lid
+  - page_average_lid_score
+  - full_doc_lid
+  - full_doc_lid_score
+  - extractor
+  - fw_edu_scores
+  - minhash_cluster_size
+  - duplicate_count
+  - source_dataset
+  - source_file
+shard: {target_size_mb: 500, max_documents: 100000}

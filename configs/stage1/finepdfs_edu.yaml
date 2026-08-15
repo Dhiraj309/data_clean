@@ -1,0 +1,13 @@
+stage: 1
+dataset: finepdfs_edu
+
+# Source registry is already narrowed to the current English eng_Latn directory.
+metadata_filters:
+  - {column: token_count, op: gte, value: 512}
+
+# Preserve all upstream quality/dedup/OCR metadata for later audits.
+output_columns: "*"
+
+shard:
+  target_size_mb: 500
+  max_documents: 100000

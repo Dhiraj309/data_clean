@@ -1,0 +1,39 @@
+pipeline:
+  version: "5.0.0"
+
+huggingface:
+  token_env_var: "HF_TOKEN"
+  private: true
+  create_missing_output_repos: true
+
+storage:
+  local_work_dir: "./work"
+  local_shard_dir: "./work/shards"
+
+compression:
+  codec: "zstd"
+  level: 6
+
+hashing:
+  algorithm: "xxh3_128"
+  dedup_batch_size: 500
+
+retry:
+  download:
+    max_attempts: 5
+    base_delay_seconds: 2.0
+    max_delay_seconds: 60.0
+    jitter_seconds: 1.0
+  upload:
+    max_attempts: 5
+    base_delay_seconds: 2.0
+    max_delay_seconds: 60.0
+    jitter_seconds: 1.0
+
+logging:
+  dir: "./logs"
+  debug_log: "debug.log"
+  events_log: "events.log"
+
+plugins:
+  filter_paths: []

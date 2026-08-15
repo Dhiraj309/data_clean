@@ -1,0 +1,30 @@
+stage: 4
+name: "laughlm-hq-50b"
+output_repo: "dignity045/laughlm-hq-50b"
+tokenizer_name_or_path: "REPLACE_WITH_FINAL_LAUGHLM_TOKENIZER"
+eos_token: "REPLACE_WITH_FINAL_EOS_TOKEN"
+eos_token_id: null
+token_dtype: auto
+exact_budget: true
+target_tokens: 50_000_000_000
+tokens_per_shard: 250_000_000
+tokenizer_batch_size: 256
+seed: 309
+
+# Starting recipe only; revise after source-quality/ablation results.
+sources:
+  dolma3_150b:
+    stage3_config: "../stage3/dolma3_150b.yaml"
+    tokens: 20_000_000_000
+  finepdfs_edu:
+    stage3_config: "../stage3/finepdfs_edu.yaml"
+    tokens: 10_000_000_000
+  fineweb_edu:
+    stage3_config: "../stage3/fineweb_edu.yaml"
+    tokens: 7_500_000_000
+  stack_edu:
+    stage3_config: "../stage3/stack_edu.yaml"
+    tokens: 7_500_000_000
+  finemath:
+    stage3_config: "../stage3/finemath.yaml"
+    tokens: 5_000_000_000
