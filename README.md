@@ -90,6 +90,25 @@ export HF_TOKEN=hf_...
 python validate_configs.py
 ```
 
+## Create an isolated Hugging Face workspace
+
+Generate a separate registry and create the Stage-1, Stage-2, Stage-3, final
+token, and sealed-evaluation dataset repositories from one namespace. The
+token is read only from `HF_TOKEN` and is never stored in generated files:
+
+```bash
+python bootstrap_hf_workspace.py \
+  --namespace LaughTaleAI \
+  --profile smoke \
+  --apply \
+  --create-tokenizer-repo
+```
+
+The generated `configs/generated/smoke/datasets.yaml` keeps all source
+datasets separated by their existing path prefixes while sharing one private
+repository per processing stage. Pass it to every Stage 1-3 command with
+`--registry configs/generated/smoke/datasets.yaml`.
+
 ## Pilot FineWeb-Edu
 
 ```bash
