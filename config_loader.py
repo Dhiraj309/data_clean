@@ -104,6 +104,9 @@ def load_stage3_bundle(
     benchmark_path = resolve_relative(stage_cfg["benchmark_config"], bundle["stage_path"])
     stage2_path = resolve_relative(stage_cfg["stage2_config"], bundle["stage_path"])
     benchmark_cfg = load_yaml(benchmark_path)
+    sealed_path_value = (benchmark_cfg.get("sealed_evaluation") or {}).get("config")
+    sealed_path = resolve_relative(sealed_path_value, benchmark_path) if sealed_path_value else None
+    sealed_cfg = load_yaml(sealed_path) if sealed_path else None
     stage2_bundle = load_stage_bundle(stage2_path, 2, common_path, registry_path)
     if stage2_bundle["dataset"]["name"] != bundle["dataset"]["name"]:
         raise ValueError("Stage-3 stage2_config points at a different dataset")
@@ -111,6 +114,9 @@ def load_stage3_bundle(
         benchmark=benchmark_cfg,
         benchmark_path=benchmark_path,
         benchmark_hash=stable_hash(benchmark_cfg),
+        sealed_evaluation=sealed_cfg,
+        sealed_evaluation_path=sealed_path,
+        sealed_evaluation_hash=stable_hash(sealed_cfg) if sealed_cfg is not None else None,
         stage2_bundle=stage2_bundle,
     )
     return bundle
@@ -180,6 +186,7 @@ def stage3_semantic_hash(bundle: Dict[str, Any]) -> str:
             "dataset": bundle["dataset"]["name"],
             "stage2_semantic_hash": stage2_semantic_hash(bundle["stage2_bundle"]),
             "benchmark_hash": bundle["benchmark_hash"],
+            "sealed_evaluation_hash": bundle.get("sealed_evaluation_hash"),
             "stage3": bundle["stage"],
         }
     )

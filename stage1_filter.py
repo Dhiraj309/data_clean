@@ -13,7 +13,8 @@ import gzip
 import json
 import logging
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List
 
@@ -27,17 +28,24 @@ from rich.console import Console
 from rich.table import Table
 
 from config_loader import load_stage_bundle, stage1_semantic_hash
+from manifest_contract import build_artifact_contract, validate_committed_manifest
 from pipeline_utils import (
     download_file,
+    ensure_disk_space,
     ensure_repo,
+    file_detail,
     hf_token,
     list_repo_files,
     matches_any,
+    read_remote_json,
     setup_logging,
     slug,
     upload_file,
+    local_work_root,
+    runtime_settings,
     utc_now,
     write_json,
+    write_failure_manifest,
 )
 
 SUPPORTED_OPS = {"eq", "neq", "gt", "gte", "lt", "lte", "in", "not_in", "contains"}
@@ -215,7 +223,7 @@ def iter_json_tables(local: Path, stage: Dict[str, Any], batch_size: int) -> tup
     return _gen(), None
 
 
-def process_source(
+def _process_source(
     filename: str,
     bundle: Dict[str, Any],
     api: HfApi,
@@ -225,19 +233,35 @@ def process_source(
 ) -> Dict[str, Any]:
     common, dataset, stage = bundle["common"], bundle["dataset"], bundle["stage"]
     source, out_repo = dataset["source"], dataset["repos"]["stage1"]
+    started_at = time.perf_counter()
     run_hash = stage1_semantic_hash(bundle)
     key = source_key(source["repo_id"], source.get("revision", "main"), filename, run_hash)
     prefix = remote_prefix(dataset["name"], run_hash, key)
     manifest_remote = f"{prefix}/manifest.json"
     if manifest_remote in existing_remote:
-        return {"source": filename, "status": "skipped"}
+        try:
+            existing_manifest = read_remote_json(out_repo, manifest_remote, token, common)
+            errors = validate_committed_manifest(
+                existing_manifest, expected_stage="stage1", available_files=existing_remote
+            )
+            if not errors:
+                return {"source": filename, "status": "skipped"}
+            logging.getLogger("stage1").warning(
+                "Ignoring uncommitted or incomplete manifest %s: %s", manifest_remote, "; ".join(errors)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("stage1").warning("Ignoring unreadable manifest %s: %s", manifest_remote, exc)
 
-    work = Path(common["storage"]["local_work_dir"]) / dataset["name"] / "stage1" / key
+    work = local_work_root(common) / dataset["name"] / "stage1" / key
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
+    download_started = time.perf_counter()
     local = download_file(
         source["repo_id"], filename, source.get("revision", "main"), token, common, work / "input"
     )
+    source_file_detail = file_detail(local, common["hashing"]["algorithm"], remote_path=filename)
+    download_seconds = time.perf_counter() - download_started
+    processing_started = time.perf_counter()
     writer = BufferedParquetWriter(work / "parts", stage["shard"]["target_size_mb"], stage["shard"]["max_documents"], common["compression"])
     fmt = source.get("format", "parquet")
     if fmt == "parquet":
@@ -248,17 +272,42 @@ def process_source(
         raise ValueError(f"Unsupported source format {fmt!r} for {dataset['name']}")
 
     accepted = 0
+    documents_seen = seen if seen is not None else 0
     for table in tables:
+        if seen is None:
+            documents_seen += table.num_rows
         accepted += table.num_rows
         writer.add(table)
     parts = writer.close()
+    processing_seconds = time.perf_counter() - processing_started
+    rejected = max(0, documents_seen - accepted)
+    rejected_by_reason = {"metadata_filter": rejected} if rejected else {}
 
     uploaded: List[str] = []
+    output_part_details: List[Dict[str, Any]] = []
+    upload_started = time.perf_counter()
     for part in parts:
         remote = f"{prefix}/{part.name}"
+        output_part_details.append(file_detail(part, common["hashing"]["algorithm"], remote_path=remote))
         upload_file(api, out_repo, part, remote, token, common)
         uploaded.append(remote)
+    upload_seconds = time.perf_counter() - upload_started
     manifest = {
+        "artifact_contract": build_artifact_contract(
+            artifact_type="dataset_stage",
+            stage="stage1",
+            dataset_id=dataset["name"],
+            run_id=run_hash,
+            config_hash=bundle["stage_hash"],
+            source_refs=[
+                {
+                    "repo_id": source["repo_id"],
+                    "revision": source.get("revision", "main"),
+                    "path": filename,
+                }
+            ],
+            attributes={"source_file": filename},
+        ),
         "version": 1,
         "stage": 1,
         "dataset": dataset["name"],
@@ -268,9 +317,34 @@ def process_source(
         "source_key": key,
         "stage1_semantic_hash": run_hash,
         "stage1_config_hash": bundle["stage_hash"],
-        "documents_seen": seen,
+        "processing_status": "committed",
+        "source_file_detail": source_file_detail,
+        "documents_seen": documents_seen,
         "documents_accepted": accepted,
+        "documents_rejected": rejected,
+        "rejected_by_reason": rejected_by_reason,
+        "duplicate_count": 0,
+        "duplicate_by_reason": {},
+        "error_count": 0,
+        "errors_by_reason": {},
+        "counts": {
+            "seen": documents_seen,
+            "accepted": accepted,
+            "rejected": rejected,
+            "duplicates": 0,
+            "errors": 0,
+            "rejected_by_reason": rejected_by_reason,
+            "duplicate_by_reason": {},
+            "errors_by_reason": {},
+        },
         "output_parts": uploaded,
+        "output_part_details": output_part_details,
+        "timings": {
+            "download_seconds": round(download_seconds, 6),
+            "processing_seconds": round(processing_seconds, 6),
+            "upload_seconds": round(upload_seconds, 6),
+            "total_seconds": round(time.perf_counter() - started_at, 6),
+        },
         "committed_at": utc_now(),
     }
     manifest_local = work / "manifest.json"
@@ -280,19 +354,78 @@ def process_source(
     return {"source": filename, "status": "processed", "accepted": accepted, "parts": len(parts)}
 
 
+def process_source(
+    filename: str,
+    bundle: Dict[str, Any],
+    api: HfApi,
+    token: str,
+    existing_remote: set[str],
+    batch_size: int,
+) -> Dict[str, Any]:
+    """Run Stage 1 and persist a retryable failure record on errors."""
+    common, dataset, source = bundle["common"], bundle["dataset"], bundle["dataset"]["source"]
+    run_hash = stage1_semantic_hash(bundle)
+    key = source_key(source["repo_id"], source.get("revision", "main"), filename, run_hash)
+    prefix = remote_prefix(dataset["name"], run_hash, key)
+    try:
+        return _process_source(filename, bundle, api, token, existing_remote, batch_size)
+    except Exception as exc:
+        contract = build_artifact_contract(
+            artifact_type="dataset_stage",
+            stage="stage1",
+            dataset_id=dataset["name"],
+            run_id=run_hash,
+            config_hash=bundle["stage_hash"],
+            source_refs=[
+                {
+                    "repo_id": source["repo_id"],
+                    "revision": source.get("revision", "main"),
+                    "path": filename,
+                }
+            ],
+            attributes={"source_file": filename},
+        )
+        write_failure_manifest(
+            api=api,
+            repo_id=dataset["repos"]["stage1"],
+            token=token,
+            common=common,
+            local_root=local_work_root(common),
+            manifest_remote=f"{prefix}/manifest.json",
+            artifact_contract=contract,
+            stage=1,
+            source_key=key,
+            exc=exc,
+        )
+        raise
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="LaughLM Stage 1 metadata/source filtering")
     parser.add_argument("--config", required=True, help="configs/stage1/<dataset>.yaml")
     parser.add_argument("--common", default=None)
     parser.add_argument("--registry", default=None)
     parser.add_argument("--limit-files", type=int, default=None)
-    parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--max-inflight-files", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     bundle = load_stage_bundle(args.config, 1, args.common, args.registry)
     common, dataset, stage = bundle["common"], bundle["dataset"], bundle["stage"]
+    runtime = runtime_settings(common)
+    file_workers = args.workers if args.workers is not None else runtime["file_workers"]
+    batch_size = args.batch_size if args.batch_size is not None else runtime["batch_rows"]
+    max_inflight = (
+        args.max_inflight_files
+        if args.max_inflight_files is not None
+        else runtime["max_inflight_files"]
+    )
+    if file_workers <= 0 or batch_size <= 0 or max_inflight <= 0:
+        raise ValueError("workers, batch-size, and max-inflight-files must be > 0")
+    effective_workers = min(file_workers, max_inflight)
+    disk = ensure_disk_space(common, local_work_root(common))
     setup_logging(common, "stage1")
     token = hf_token(common)
     api = HfApi(token=token)
@@ -316,18 +449,41 @@ def main() -> None:
     table.add_row("Matched files", str(len(files)))
     table.add_row("Run hash", run_hash[:12])
     table.add_row("Output", dataset["repos"]["stage1"])
+    table.add_row("File workers", str(effective_workers))
+    table.add_row("Max in-flight files", str(max_inflight))
+    table.add_row("Batch rows", str(batch_size))
+    table.add_row("Free disk GiB", str(disk["free_gib"]))
     Console().print(table)
     if args.dry_run:
         return
 
     results = []
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = [pool.submit(process_source, f, bundle, api, token, existing, args.batch_size) for f in files]
-        for fut in as_completed(futures):
-            result = fut.result()
-            results.append(result)
-            logging.getLogger("stage1").info("%s", result)
-            Console().print(result)
+    file_iter = iter(files)
+    with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+        pending = set()
+        for _ in range(min(max_inflight, len(files))):
+            try:
+                filename = next(file_iter)
+            except StopIteration:
+                break
+            pending.add(
+                pool.submit(process_source, filename, bundle, api, token, existing, batch_size)
+            )
+
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                result = future.result()
+                results.append(result)
+                logging.getLogger("stage1").info("%s", result)
+                Console().print(result)
+                try:
+                    filename = next(file_iter)
+                except StopIteration:
+                    continue
+                pending.add(
+                    pool.submit(process_source, filename, bundle, api, token, existing, batch_size)
+                )
     processed = sum(r["status"] == "processed" for r in results)
     skipped = sum(r["status"] == "skipped" for r in results)
     Console().print(f"[green]Stage 1 complete[/green]: processed={processed} skipped={skipped}")

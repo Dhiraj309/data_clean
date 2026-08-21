@@ -2,6 +2,7 @@
 # Dataset-specific filtering belongs in configs/stage1, stage2 and stage3.
 datasets:
   fineweb_edu:
+    source_priority: 10
     source:
       repo_id: "HuggingFaceFW/fineweb_edu_100BT-shuffled"
       revision: "main"
@@ -15,6 +16,7 @@ datasets:
       stage3: "dignity045/laughlm-fineweb-edu-hq"
 
   finepdfs_edu:
+    source_priority: 40
     source:
       repo_id: "HuggingFaceFW/finepdfs-edu"
       revision: "main"
@@ -29,6 +31,7 @@ datasets:
       stage3: "dignity045/laughlm-finepdfs-edu-hq"
 
   finemath:
+    source_priority: 50
     source:
       repo_id: "HuggingFaceTB/finemath"
       revision: "main"
@@ -43,6 +46,7 @@ datasets:
       stage3: "dignity045/laughlm-finemath-hq"
 
   stack_edu:
+    source_priority: 30
     source:
       repo_id: "HuggingFaceTB/stack-edu"
       revision: "main"
@@ -56,6 +60,7 @@ datasets:
       stage3: "dignity045/laughlm-stack-edu-hq"
 
   dolma3_150b:
+    source_priority: 20
     source:
       repo_id: "allenai/dolma3_mix-150B-1025"
       revision: "main"

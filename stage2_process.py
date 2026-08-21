@@ -31,26 +31,32 @@ import datatrove.pipeline.filters as dt_filters
 import datatrove.pipeline.formatters as dt_formatters
 
 import filters as custom_filters
+from document_identity import DocumentIdentity, document_identity, hamming_distance
 from config_loader import (
     load_stage_bundle,
     resolve_relative,
     stage1_semantic_hash,
     stage2_semantic_hash,
 )
+from manifest_contract import build_artifact_contract, validate_committed_manifest
 from pipeline_utils import (
     download_file,
     ensure_repo,
+    file_detail,
     hf_token,
     list_repo_files,
     read_remote_json,
     setup_logging,
     slug,
     upload_file,
+    local_work_root,
     utc_now,
     write_json,
+    write_failure_manifest,
 )
 
 SQLITE_QUERY_CHUNK = 500
+INTERNAL_METADATA_FIELDS = ("dedup_group", "near_duplicate_fingerprint", "source_priority", "split", "split_group")
 
 
 def source_key(stage1_manifest: Dict[str, Any], run_hash: str) -> str:
@@ -73,6 +79,8 @@ class CommittedHashStore:
         self.conn.execute("PRAGMA temp_store=MEMORY")
         self.conn.execute("PRAGMA mmap_size=268435456")
         self.conn.execute("CREATE TABLE IF NOT EXISTS hashes (h BLOB PRIMARY KEY)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS normalized_hashes (h BLOB PRIMARY KEY)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS near_hashes (fingerprint TEXT PRIMARY KEY, bucket INTEGER NOT NULL)")
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS sources (source_key TEXT PRIMARY KEY, manifest_path TEXT NOT NULL, committed_at TEXT NOT NULL)"
         )
@@ -81,6 +89,8 @@ class CommittedHashStore:
         prev_alg = self.conn.execute("SELECT v FROM metadata WHERE k='algorithm'").fetchone()
         if (prev and prev[0] != namespace) or (prev_alg and prev_alg[0] != algorithm):
             self.conn.execute("DELETE FROM hashes")
+            self.conn.execute("DELETE FROM normalized_hashes")
+            self.conn.execute("DELETE FROM near_hashes")
             self.conn.execute("DELETE FROM sources")
         self.conn.execute("INSERT OR REPLACE INTO metadata(k,v) VALUES('namespace',?)", (namespace,))
         self.conn.execute("INSERT OR REPLACE INTO metadata(k,v) VALUES('algorithm',?)", (algorithm,))
@@ -99,11 +109,52 @@ class CommittedHashStore:
             out.update(r[0] for r in rows)
         return out
 
+    def existing_normalized(self, digests: Sequence[bytes]) -> set[bytes]:
+        out: set[bytes] = set()
+        for i in range(0, len(digests), SQLITE_QUERY_CHUNK):
+            chunk = list(digests[i : i + SQLITE_QUERY_CHUNK])
+            if not chunk:
+                continue
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"SELECT h FROM normalized_hashes WHERE h IN ({placeholders})", chunk
+            ).fetchall()
+            out.update(r[0] for r in rows)
+        return out
+
+    def near_duplicate(self, fingerprint: int, bucket_bits: int, max_distance: int) -> bool:
+        if not 1 <= bucket_bits <= 64:
+            raise ValueError("near-duplicate bucket_bits must be between 1 and 64")
+        bucket = fingerprint >> (64 - bucket_bits)
+        rows = self.conn.execute(
+            "SELECT fingerprint FROM near_hashes WHERE bucket=?", (bucket,)
+        ).fetchall()
+        return any(
+            hamming_distance(fingerprint, int(value, 16)) <= max_distance
+            for (value,) in rows
+        )
+
     def commit_sidecar(self, key: str, manifest_path: str, sidecar: Path, digest_size: int) -> int:
+        return self.commit_sidecars(key, manifest_path, sidecar, None, None, digest_size)
+
+    def commit_sidecars(
+        self,
+        key: str,
+        manifest_path: str,
+        sidecar: Path,
+        normalized_sidecar: Path | None,
+        near_sidecar: Path | None,
+        digest_size: int,
+        near_bucket_bits: int = 8,
+    ) -> int:
         if self.source_is_committed(key):
             return 0
         if sidecar.stat().st_size % digest_size:
             raise IOError(f"Corrupt hash sidecar: {sidecar}")
+        if normalized_sidecar is not None and normalized_sidecar.stat().st_size % digest_size:
+            raise IOError(f"Corrupt normalized hash sidecar: {normalized_sidecar}")
+        if near_sidecar is not None and near_sidecar.stat().st_size % 8:
+            raise IOError(f"Corrupt near-duplicate sidecar: {near_sidecar}")
         inserted = 0
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -123,6 +174,31 @@ class CommittedHashStore:
                     before = self.conn.total_changes
                     self.conn.executemany("INSERT OR IGNORE INTO hashes(h) VALUES(?)", batch)
                     inserted += self.conn.total_changes - before
+            if normalized_sidecar is not None:
+                with normalized_sidecar.open("rb") as f:
+                    batch = []
+                    while True:
+                        d = f.read(digest_size)
+                        if not d:
+                            break
+                        batch.append((d,))
+                        if len(batch) >= 10000:
+                            self.conn.executemany("INSERT OR IGNORE INTO normalized_hashes(h) VALUES(?)", batch)
+                            batch.clear()
+                    if batch:
+                        self.conn.executemany("INSERT OR IGNORE INTO normalized_hashes(h) VALUES(?)", batch)
+            if near_sidecar is not None:
+                with near_sidecar.open("rb") as f:
+                    while True:
+                        raw = f.read(8)
+                        if not raw:
+                            break
+                        fingerprint = int.from_bytes(raw, "big")
+                        bucket = fingerprint >> (64 - near_bucket_bits)
+                        self.conn.execute(
+                            "INSERT OR IGNORE INTO near_hashes(fingerprint,bucket) VALUES(?,?)",
+                            (f"{fingerprint:016x}", bucket),
+                        )
             self.conn.execute(
                 "INSERT INTO sources(source_key,manifest_path,committed_at) VALUES(?,?,?)",
                 (key, manifest_path, utc_now()),
@@ -149,49 +225,121 @@ class RegistryAdapterStep(PipelineStep):
             cleaned, reason = custom_filters.run_pipeline(doc.text, self.steps)
             if cleaned is None:
                 self.metrics["custom_rejected"] += 1
+                reason_key = f"custom_filter:{reason or 'rejected'}"
+                self.metrics["rejected_by_reason"][reason_key] = (
+                    self.metrics["rejected_by_reason"].get(reason_key, 0) + 1
+                )
                 continue
             doc.text = cleaned
             yield doc
 
 
-class CrashSafeExactDedupStep(PipelineStep):
-    name = "Crash-safe exact dedup"
-    def __init__(self, store: CommittedHashStore, algorithm: str, batch_size: int, sidecar: Path, metrics: Dict[str, int]) -> None:
+class CrashSafeDedupStep(PipelineStep):
+    name = "Crash-safe exact and normalized dedup"
+    def __init__(
+        self,
+        store: CommittedHashStore,
+        algorithm: str,
+        batch_size: int,
+        sidecar: Path,
+        normalized_sidecar: Path,
+        near_sidecar: Path | None,
+        metrics: Dict[str, Any],
+        identity_policy: Dict[str, Any],
+        near_policy: Dict[str, Any],
+        source_priority: int,
+    ) -> None:
         super().__init__()
         self.store = store
-        self.hasher = xxhash.xxh3_128 if algorithm == "xxh3_128" else xxhash.xxh64
+        self.algorithm = algorithm
         self.batch_size = batch_size
         self.sidecar = sidecar
+        self.normalized_sidecar = normalized_sidecar
+        self.near_sidecar = near_sidecar
         self.metrics = metrics
+        self.identity_policy = identity_policy
+        self.near_policy = near_policy
+        self.near_enabled = bool(near_policy.get("enabled", False)) and near_sidecar is not None
+        if not 1 <= int(near_policy.get("bucket_bits", 8)) <= 64:
+            raise ValueError("near-duplicate bucket_bits must be between 1 and 64")
+        self.source_priority = source_priority
         self.seen_current: set[bytes] = set()
+        self.seen_normalized_current: set[bytes] = set()
+        self.seen_near_current: Dict[int, List[int]] = {}
         sidecar.parent.mkdir(parents=True, exist_ok=True)
+        normalized_sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_bytes(b"")
+        normalized_sidecar.write_bytes(b"")
+        if near_sidecar is not None:
+            near_sidecar.parent.mkdir(parents=True, exist_ok=True)
+            near_sidecar.write_bytes(b"")
 
     def run(self, data: DocumentsPipeline, rank: int = 0, world_size: int = 1) -> DocumentsPipeline:
         del rank, world_size
         docs: List[Document] = []
-        hashes: List[bytes] = []
-        with self.sidecar.open("ab") as side:
+        identities: List[DocumentIdentity] = []
+        with self.sidecar.open("ab") as side, self.normalized_sidecar.open("ab") as normalized_side:
+            near_handle = self.near_sidecar.open("ab") if self.near_sidecar is not None else None
             def flush() -> Iterator[Document]:
                 if not docs:
                     return iter(())
-                existing = self.store.existing(hashes)
+                exact = [identity.exact_digest for identity in identities]
+                normalized = [identity.normalized_digest for identity in identities]
+                existing = self.store.existing(exact)
+                existing_normalized = self.store.existing_normalized(normalized)
                 kept: List[Document] = []
-                for doc, digest in zip(docs, hashes):
-                    if digest in existing or digest in self.seen_current:
+                for doc, identity in zip(docs, identities):
+                    duplicate_reason = None
+                    if identity.exact_digest in existing or identity.exact_digest in self.seen_current:
+                        duplicate_reason = "exact_text_hash"
+                    elif identity.normalized_digest in existing_normalized or identity.normalized_digest in self.seen_normalized_current:
+                        duplicate_reason = "normalized_text_hash"
+                    elif self.near_enabled:
+                        bucket_bits = int(self.near_policy.get("bucket_bits", 8))
+                        max_distance = int(self.near_policy.get("max_hamming_distance", 3))
+                        bucket = identity.near_fingerprint >> (64 - bucket_bits)
+                        current_near = self.seen_near_current.get(bucket, [])
+                        if self.store.near_duplicate(identity.near_fingerprint, bucket_bits, max_distance) or any(
+                            hamming_distance(identity.near_fingerprint, value) <= max_distance
+                            for value in current_near
+                        ):
+                            duplicate_reason = "near_duplicate_simhash"
+                    if duplicate_reason is not None:
                         self.metrics["duplicates"] += 1
+                        if duplicate_reason == "near_duplicate_simhash":
+                            self.metrics["near_duplicates"] += 1
+                        self.metrics["duplicate_by_reason"][duplicate_reason] = (
+                            self.metrics["duplicate_by_reason"].get(duplicate_reason, 0) + 1
+                        )
                         continue
-                    self.seen_current.add(digest)
-                    side.write(digest)
+                    self.seen_current.add(identity.exact_digest)
+                    self.seen_normalized_current.add(identity.normalized_digest)
+                    side.write(identity.exact_digest)
+                    normalized_side.write(identity.normalized_digest)
+                    if self.near_enabled and near_handle is not None:
+                        near_handle.write(identity.near_fingerprint.to_bytes(8, "big"))
+                        bucket_bits = int(self.near_policy.get("bucket_bits", 8))
+                        bucket = identity.near_fingerprint >> (64 - bucket_bits)
+                        self.seen_near_current.setdefault(bucket, []).append(identity.near_fingerprint)
+                    if doc.metadata is None:
+                        doc.metadata = {}
+                    doc.metadata["dedup_group"] = identity.normalized_digest.hex()
+                    doc.metadata["near_duplicate_fingerprint"] = f"{identity.near_fingerprint:016x}"
+                    doc.metadata["source_priority"] = self.source_priority
                     kept.append(doc)
-                docs.clear(); hashes.clear()
+                docs.clear(); identities.clear()
                 return iter(kept)
             for doc in data:
                 docs.append(doc)
-                hashes.append(self.hasher(doc.text.encode("utf-8")).digest())
+                identities.append(document_identity(doc.text, self.algorithm, self.identity_policy))
                 if len(docs) >= self.batch_size:
                     yield from flush()
             yield from flush()
+            if near_handle is not None:
+                near_handle.close()
+
+
+CrashSafeExactDedupStep = CrashSafeDedupStep
 
 
 class LocalParquetSink(PipelineStep):
@@ -224,7 +372,7 @@ class LocalParquetSink(PipelineStep):
         del rank, world_size
         for doc in data:
             row = {"id": doc.id, "text": doc.text}
-            for field in self.metadata_fields:
+            for field in dict.fromkeys([*self.metadata_fields, *INTERNAL_METADATA_FIELDS]):
                 row[field] = doc.metadata.get(field)
             self.rows.append(row)
             self.bytes += len(doc.text.encode("utf-8"))
@@ -291,7 +439,13 @@ def list_stage1_manifests(bundle: Dict[str, Any], s1_bundle: Dict[str, Any], api
 def reconcile_namespace(bundle: Dict[str, Any], api: HfApi, token: str, store: CommittedHashStore) -> None:
     common, registry, stage = bundle["common"], bundle["registry"], bundle["stage"]
     namespace = slug(stage["dedup_namespace"])
-    for name, entry in registry.items():
+    # Rebuild the namespace in source-priority order so the configured winner
+    # policy is independent of HF listing order and the order of stage runs.
+    registry_items = sorted(
+        registry.items(),
+        key=lambda item: (-int(item[1].get("source_priority", 0)), item[0]),
+    )
+    for name, entry in registry_items:
         repo = entry.get("repos", {}).get("stage2")
         if not repo:
             continue
@@ -301,16 +455,37 @@ def reconcile_namespace(bundle: Dict[str, Any], api: HfApi, token: str, store: C
             logging.getLogger("stage2.reconcile").warning("Could not inspect %s: %s", repo, exc)
             continue
         prefix = f"{name}/dedup/{namespace}/"
-        for manifest_path in (f for f in files if f.startswith(prefix) and f.endswith("/manifest.json")):
+        manifest_paths = sorted(
+            f for f in files if f.startswith(prefix) and f.endswith("/manifest.json")
+        )
+        for manifest_path in manifest_paths:
             manifest = read_remote_json(repo, manifest_path, token, common)
             key = manifest["source_key"]
             if store.source_is_committed(key):
                 continue
+            normalized_path = manifest.get("normalized_hash_sidecar")
+            if not normalized_path or normalized_path not in files:
+                logging.getLogger("stage2.reconcile").warning(
+                    "Skipping legacy manifest without normalized hash sidecar: %s", manifest_path
+                )
+                continue
             side = download_file(repo, manifest["hash_sidecar"], "main", token, common)
-            store.commit_sidecar(key, manifest_path, side, int(manifest["hash_digest_size"]))
+            normalized_side = download_file(repo, normalized_path, "main", token, common)
+            near_side = None
+            if manifest.get("near_duplicate_sidecar") in files:
+                near_side = download_file(repo, manifest["near_duplicate_sidecar"], "main", token, common)
+            store.commit_sidecars(
+                key,
+                manifest_path,
+                side,
+                normalized_side,
+                near_side,
+                int(manifest["hash_digest_size"]),
+                int((manifest.get("near_duplicate_policy") or {}).get("bucket_bits", 8)),
+            )
 
 
-def process_source(bundle: Dict[str, Any], s1_manifest_path: str, api: HfApi, token: str, store: CommittedHashStore) -> Dict[str, Any]:
+def _process_source(bundle: Dict[str, Any], s1_manifest_path: str, api: HfApi, token: str, store: CommittedHashStore) -> Dict[str, Any]:
     common, dataset, stage = bundle["common"], bundle["dataset"], bundle["stage"]
     s1_repo, s2_repo = dataset["repos"]["stage1"], dataset["repos"]["stage2"]
     s1_manifest = read_remote_json(s1_repo, s1_manifest_path, token, common)
@@ -321,19 +496,73 @@ def process_source(bundle: Dict[str, Any], s1_manifest_path: str, api: HfApi, to
 
     remote_files = set(list_repo_files(api, s2_repo, token, common))
     if manifest_remote in remote_files:
-        if not store.source_is_committed(key):
+        try:
             manifest = read_remote_json(s2_repo, manifest_remote, token, common)
-            side = download_file(s2_repo, manifest["hash_sidecar"], "main", token, common)
-            store.commit_sidecar(key, manifest_remote, side, int(manifest["hash_digest_size"]))
-        return {"source": s1_manifest["source_file"], "status": "skipped"}
+            errors = validate_committed_manifest(
+                manifest, expected_stage="stage2", available_files=remote_files
+            )
+            normalized_path = manifest.get("normalized_hash_sidecar")
+            near_path = manifest.get("near_duplicate_sidecar")
+            near_required = bool((common.get("deduplication") or {}).get("near_duplicate", {}).get("enabled", False))
+            if (
+                not errors
+                and manifest.get("hash_sidecar") in remote_files
+                and normalized_path in remote_files
+                and (not near_required or near_path in remote_files)
+            ):
+                if not store.source_is_committed(key):
+                    side = download_file(s2_repo, manifest["hash_sidecar"], "main", token, common)
+                    normalized_side = download_file(s2_repo, normalized_path, "main", token, common)
+                    near_side = download_file(s2_repo, near_path, "main", token, common) if near_required else None
+                    store.commit_sidecars(
+                        key, manifest_remote, side, normalized_side, near_side,
+                        int(manifest["hash_digest_size"]),
+                        int((manifest.get("near_duplicate_policy") or {}).get("bucket_bits", 8)),
+                    )
+                return {"source": s1_manifest["source_file"], "status": "skipped"}
+            if manifest.get("hash_sidecar") not in remote_files:
+                errors.append("hash_sidecar is missing")
+            if normalized_path not in remote_files:
+                errors.append("normalized_hash_sidecar is missing")
+            if near_required and near_path not in remote_files:
+                errors.append("near_duplicate_sidecar is missing")
+            logging.getLogger("stage2").warning(
+                "Ignoring incomplete manifest %s: %s", manifest_remote, "; ".join(errors)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("stage2").warning("Ignoring unreadable manifest %s: %s", manifest_remote, exc)
 
-    work = Path(common["storage"]["local_work_dir"]) / dataset["name"] / "stage2" / key
+    work = local_work_root(common) / dataset["name"] / "stage2" / key
     shutil.rmtree(work, ignore_errors=True)
     inputs = work / "input"; inputs.mkdir(parents=True, exist_ok=True)
     sidecar = work / "accepted.hashes"
-    metrics = {"seen": 0, "accepted": 0, "duplicates": 0, "custom_rejected": 0}
+    normalized_sidecar = work / "accepted.normalized.hashes"
+    near_policy = (common.get("deduplication") or {}).get("near_duplicate", {})
+    near_sidecar = work / "accepted.near.hashes" if near_policy.get("enabled", False) else None
+    identity_policy = (common.get("deduplication") or {}).get("normalized", {})
+    source_priority = int(dataset.get("source_priority", 0))
+    metrics = {
+        "seen": 0,
+        "accepted": 0,
+        "duplicates": 0,
+        "custom_rejected": 0,
+        "near_duplicates": 0,
+        "rejected_by_reason": {},
+        "duplicate_by_reason": {},
+    }
     sink = LocalParquetSink(work / "parts", stage.get("output_metadata_fields", []), stage["shard"], common["compression"], metrics)
-    dedup = CrashSafeExactDedupStep(store, common["hashing"]["algorithm"], int(common["hashing"].get("dedup_batch_size", 500)), sidecar, metrics)
+    dedup = CrashSafeDedupStep(
+        store,
+        common["hashing"]["algorithm"],
+        int(common["hashing"].get("dedup_batch_size", 500)),
+        sidecar,
+        normalized_sidecar,
+        near_sidecar,
+        metrics,
+        identity_policy,
+        near_policy,
+        source_priority,
+    )
 
     def count_seen(data: DocumentsPipeline, rank: int = 0, world_size: int = 1):
         del rank, world_size
@@ -341,8 +570,10 @@ def process_source(bundle: Dict[str, Any], s1_manifest_path: str, api: HfApi, to
             metrics["seen"] += 1
             yield doc
 
+    input_part_details = []
     for remote_part in s1_manifest["output_parts"]:
         local = download_file(s1_repo, remote_part, "main", token, common, inputs)
+        input_part_details.append(file_detail(local, common["hashing"]["algorithm"], remote_path=remote_part))
         pipeline: List[Any] = [
             ParquetReader(
                 data_folder=str(local.parent),
@@ -365,18 +596,51 @@ def process_source(bundle: Dict[str, Any], s1_manifest_path: str, api: HfApi, to
 
     digest_size = 16 if common["hashing"]["algorithm"] == "xxh3_128" else 8
     side_count = sidecar.stat().st_size // digest_size if sidecar.exists() else 0
+    normalized_side_count = normalized_sidecar.stat().st_size // digest_size if normalized_sidecar.exists() else 0
+    near_side_count = near_sidecar.stat().st_size // 8 if near_sidecar is not None and near_sidecar.exists() else 0
     rows = sum(pq.ParquetFile(p).metadata.num_rows for p in sink.paths)
-    if side_count != rows or rows != metrics["accepted"]:
-        raise IOError(f"Stage-2 atomic verification failed: sidecar={side_count} rows={rows} accepted={metrics['accepted']}")
+    if side_count != rows or normalized_side_count != rows or (near_sidecar is not None and near_side_count != rows) or rows != metrics["accepted"]:
+        raise IOError(
+            "Stage-2 atomic verification failed: "
+            f"exact={side_count} normalized={normalized_side_count} near={near_side_count} "
+            f"rows={rows} accepted={metrics['accepted']}"
+        )
 
     uploaded = []
+    output_part_details = []
     for part in sink.paths:
         remote = f"{prefix}/{part.name}"
+        output_part_details.append(file_detail(part, common["hashing"]["algorithm"], remote_path=remote))
         upload_file(api, s2_repo, part, remote, token, common)
         uploaded.append(remote)
     side_remote = f"{prefix}/accepted.hashes"
     upload_file(api, s2_repo, sidecar, side_remote, token, common)
+    normalized_side_remote = f"{prefix}/accepted.normalized.hashes"
+    upload_file(api, s2_repo, normalized_sidecar, normalized_side_remote, token, common)
+    near_side_remote = None
+    if near_sidecar is not None:
+        near_side_remote = f"{prefix}/accepted.near.hashes"
+        upload_file(api, s2_repo, near_sidecar, near_side_remote, token, common)
     manifest = {
+        "artifact_contract": build_artifact_contract(
+            artifact_type="dataset_stage",
+            stage="stage2",
+            dataset_id=dataset["name"],
+            run_id=run_hash,
+            config_hash=bundle["stage_hash"],
+            source_refs=[
+                {
+                    "repo_id": s1_repo,
+                    "revision": "main",
+                    "path": s1_manifest_path,
+                    "stage": "stage1",
+                }
+            ],
+            attributes={
+                "source_file": s1_manifest["source_file"],
+                "dedup_namespace": stage["dedup_namespace"],
+            },
+        ),
         "version": 1,
         "stage": 2,
         "dataset": dataset["name"],
@@ -385,21 +649,91 @@ def process_source(bundle: Dict[str, Any], s1_manifest_path: str, api: HfApi, to
         "stage1_manifest": s1_manifest_path,
         "stage2_semantic_hash": run_hash,
         "stage2_config_hash": bundle["stage_hash"],
+        "processing_status": "committed",
+        "source_priority": source_priority,
+        "source_priority_policy": (common.get("deduplication") or {}).get("source_priority", {}),
         "hash_algorithm": common["hashing"]["algorithm"],
         "hash_digest_size": digest_size,
         "hash_sidecar": side_remote,
+        "normalized_hash_sidecar": normalized_side_remote,
+        "near_duplicate_sidecar": near_side_remote,
+        "near_duplicate_policy": near_policy,
+        "input_part_details": input_part_details,
         "documents_seen": metrics["seen"],
         "accepted": metrics["accepted"],
         "duplicates": metrics["duplicates"],
+        "near_duplicates": metrics["near_duplicates"],
         "custom_rejections": metrics["custom_rejected"],
+        "rejected": metrics["custom_rejected"],
+        "rejected_by_reason": dict(sorted(metrics["rejected_by_reason"].items())),
+        "duplicate_by_reason": dict(sorted(metrics["duplicate_by_reason"].items())),
+        "error_count": 0,
+        "errors_by_reason": {},
+        "counts": {
+            "seen": metrics["seen"],
+            "accepted": metrics["accepted"],
+            "rejected": metrics["custom_rejected"],
+            "duplicates": metrics["duplicates"],
+            "near_duplicates": metrics["near_duplicates"],
+            "errors": 0,
+            "rejected_by_reason": dict(sorted(metrics["rejected_by_reason"].items())),
+            "duplicate_by_reason": dict(sorted(metrics["duplicate_by_reason"].items())),
+            "errors_by_reason": {},
+        },
         "output_parts": uploaded,
+        "output_part_details": output_part_details,
         "committed_at": utc_now(),
     }
     manifest_local = work / "manifest.json"; write_json(manifest_local, manifest)
     upload_file(api, s2_repo, manifest_local, manifest_remote, token, common)  # commit marker last
-    store.commit_sidecar(key, manifest_remote, sidecar, digest_size)
+    store.commit_sidecars(
+        key,
+        manifest_remote,
+        sidecar,
+        normalized_sidecar,
+        near_sidecar,
+        digest_size,
+        int(near_policy.get("bucket_bits", 8)),
+    )
     shutil.rmtree(work, ignore_errors=True)
     return {"source": s1_manifest["source_file"], "status": "processed", **metrics}
+
+
+def process_source(
+    bundle: Dict[str, Any], s1_manifest_path: str, api: HfApi, token: str, store: CommittedHashStore
+) -> Dict[str, Any]:
+    """Run Stage 2 and persist a retryable failure record on errors."""
+    common, dataset, stage = bundle["common"], bundle["dataset"], bundle["stage"]
+    run_hash = stage2_semantic_hash(bundle)
+    key = s1_manifest_path.rstrip("/").split("/")[-2]
+    prefix = remote_prefix(dataset["name"], stage["dedup_namespace"], run_hash, key)
+    try:
+        return _process_source(bundle, s1_manifest_path, api, token, store)
+    except Exception as exc:
+        contract = build_artifact_contract(
+            artifact_type="dataset_stage",
+            stage="stage2",
+            dataset_id=dataset["name"],
+            run_id=run_hash,
+            config_hash=bundle["stage_hash"],
+            source_refs=[
+                {"repo_id": dataset["repos"]["stage1"], "revision": "main", "path": s1_manifest_path, "stage": "stage1"}
+            ],
+            attributes={"source_key": key, "dedup_namespace": stage["dedup_namespace"]},
+        )
+        write_failure_manifest(
+            api=api,
+            repo_id=dataset["repos"]["stage2"],
+            token=token,
+            common=common,
+            local_root=local_work_root(common),
+            manifest_remote=f"{prefix}/manifest.json",
+            artifact_contract=contract,
+            stage=2,
+            source_key=key,
+            exc=exc,
+        )
+        raise
 
 
 def main() -> None:
@@ -437,7 +771,7 @@ def main() -> None:
     if args.dry_run:
         return
 
-    db = Path(common["storage"]["local_work_dir"]) / "dedup" / f"{slug(stage['dedup_namespace'])}.sqlite3"
+    db = local_work_root(common) / "dedup" / f"{slug(stage['dedup_namespace'])}.sqlite3"
     store = CommittedHashStore(db, stage["dedup_namespace"], common["hashing"]["algorithm"])
     try:
         if not args.skip_dedup_reconcile:
