@@ -91,6 +91,15 @@ runtime:
 - [x] Document resource profiles and operational recovery.
 - [x] Produce the final manifest consumed by LaughLM.
 
+### M7 - Stage-2 throughput and canonical execution `[~]`
+
+- [x] Skip optional SimHash work when near-duplicate detection is disabled.
+- [x] Record Stage-2 per-input-part download and processing timings.
+- [x] Add a canonical corpus driver that enforces source-priority ordering.
+- [x] Version the dedup namespace after the non-canonical smoke attempt.
+- [ ] Add resumable parallel map/reduce execution for Stage 2 on multi-core VMs.
+- [ ] Benchmark and freeze a 24-core resource profile against a representative corpus slice.
+
 ## Implementation order
 
 M0 → M1 → M2 → M3 → M4 → M5 → M6.

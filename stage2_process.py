@@ -13,6 +13,7 @@ import json
 import logging
 import shutil
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
@@ -297,6 +298,8 @@ class CrashSafeDedupStep(PipelineStep):
                     elif self.near_enabled:
                         bucket_bits = int(self.near_policy.get("bucket_bits", 8))
                         max_distance = int(self.near_policy.get("max_hamming_distance", 3))
+                        if identity.near_fingerprint is None:
+                            raise RuntimeError("near-duplicate detection requires a SimHash fingerprint")
                         bucket = identity.near_fingerprint >> (64 - bucket_bits)
                         current_near = self.seen_near_current.get(bucket, [])
                         if self.store.near_duplicate(identity.near_fingerprint, bucket_bits, max_distance) or any(
@@ -317,6 +320,8 @@ class CrashSafeDedupStep(PipelineStep):
                     side.write(identity.exact_digest)
                     normalized_side.write(identity.normalized_digest)
                     if self.near_enabled and near_handle is not None:
+                        if identity.near_fingerprint is None:
+                            raise RuntimeError("near-duplicate detection requires a SimHash fingerprint")
                         near_handle.write(identity.near_fingerprint.to_bytes(8, "big"))
                         bucket_bits = int(self.near_policy.get("bucket_bits", 8))
                         bucket = identity.near_fingerprint >> (64 - bucket_bits)
@@ -324,14 +329,25 @@ class CrashSafeDedupStep(PipelineStep):
                     if doc.metadata is None:
                         doc.metadata = {}
                     doc.metadata["dedup_group"] = identity.normalized_digest.hex()
-                    doc.metadata["near_duplicate_fingerprint"] = f"{identity.near_fingerprint:016x}"
+                    doc.metadata["near_duplicate_fingerprint"] = (
+                        f"{identity.near_fingerprint:016x}"
+                        if identity.near_fingerprint is not None
+                        else None
+                    )
                     doc.metadata["source_priority"] = self.source_priority
                     kept.append(doc)
                 docs.clear(); identities.clear()
                 return iter(kept)
             for doc in data:
                 docs.append(doc)
-                identities.append(document_identity(doc.text, self.algorithm, self.identity_policy))
+                identities.append(
+                    document_identity(
+                        doc.text,
+                        self.algorithm,
+                        self.identity_policy,
+                        include_near_fingerprint=self.near_enabled,
+                    )
+                )
                 if len(docs) >= self.batch_size:
                     yield from flush()
             yield from flush()
@@ -571,8 +587,11 @@ def _process_source(bundle: Dict[str, Any], s1_manifest_path: str, api: HfApi, t
             yield doc
 
     input_part_details = []
+    part_timings = []
     for remote_part in s1_manifest["output_parts"]:
+        part_started = time.perf_counter()
         local = download_file(s1_repo, remote_part, "main", token, common, inputs)
+        download_seconds = time.perf_counter() - part_started
         input_part_details.append(file_detail(local, common["hashing"]["algorithm"], remote_path=remote_part))
         pipeline: List[Any] = [
             ParquetReader(
@@ -592,6 +611,15 @@ def _process_source(bundle: Dict[str, Any], s1_manifest_path: str, api: HfApi, t
             sink,
         ]
         run_pipeline_inline(pipeline)
+        total_seconds = time.perf_counter() - part_started
+        part_timings.append(
+            {
+                "input_part": remote_part,
+                "download_seconds": round(download_seconds, 3),
+                "process_seconds": round(total_seconds - download_seconds, 3),
+                "total_seconds": round(total_seconds, 3),
+            }
+        )
         local.unlink(missing_ok=True)
 
     digest_size = 16 if common["hashing"]["algorithm"] == "xxh3_128" else 8
@@ -659,6 +687,7 @@ def _process_source(bundle: Dict[str, Any], s1_manifest_path: str, api: HfApi, t
         "near_duplicate_sidecar": near_side_remote,
         "near_duplicate_policy": near_policy,
         "input_part_details": input_part_details,
+        "part_timings": part_timings,
         "documents_seen": metrics["seen"],
         "accepted": metrics["accepted"],
         "duplicates": metrics["duplicates"],
@@ -744,6 +773,11 @@ def main() -> None:
     parser.add_argument("--limit-sources", type=int, default=None)
     parser.add_argument("--skip-dedup-reconcile", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--allow-standalone",
+        action="store_true",
+        help="Recovery-only: bypass the canonical cross-dataset priority driver.",
+    )
     args = parser.parse_args()
 
     bundle = load_stage_bundle(args.config, 2, args.common, args.registry)
@@ -761,7 +795,8 @@ def main() -> None:
         manifests = manifests[: args.limit_sources]
     run_hash = stage2_semantic_hash(bundle)
 
-    table = Table(title=f"Stage 2 dry-run — {dataset['name']}")
+    mode = "dry-run" if args.dry_run else "run"
+    table = Table(title=f"Stage 2 {mode} — {dataset['name']}")
     table.add_column("Field"); table.add_column("Value")
     table.add_row("Stage-1 sources", str(len(manifests)))
     table.add_row("Dedup namespace", stage["dedup_namespace"])
@@ -770,6 +805,12 @@ def main() -> None:
     Console().print(table)
     if args.dry_run:
         return
+    if not args.allow_standalone:
+        raise SystemExit(
+            "Standalone Stage 2 is disabled for shared dedup safety. Use "
+            "stage2_corpus.py --plan configs/stage2_corpus.yaml, or pass "
+            "--allow-standalone only for an explicitly isolated recovery run."
+        )
 
     db = local_work_root(common) / "dedup" / f"{slug(stage['dedup_namespace'])}.sqlite3"
     store = CommittedHashStore(db, stage["dedup_namespace"], common["hashing"]["algorithm"])

@@ -1,6 +1,6 @@
 stage: 2
 dataset: stack_edu
-dedup_namespace: "laughlm-hq-v1"
+dedup_namespace: "laughlm-hq-v2"
 stage1_config: "../stage1/stack_edu.yaml"
 text_column: text
 id_column: id

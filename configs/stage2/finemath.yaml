@@ -1,6 +1,6 @@
 stage: 2
 dataset: finemath
-dedup_namespace: "laughlm-hq-v1"
+dedup_namespace: "laughlm-hq-v2"
 stage1_config: "../stage1/finemath.yaml"
 text_column: text
 id_column: id

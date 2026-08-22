@@ -117,9 +117,8 @@ python stage1_filter.py \
   --limit-files 10 \
   --workers 2
 
-python stage2_process.py \
-  --config configs/stage2/fineweb_edu.yaml \
-  --limit-sources 10
+python stage2_corpus.py \
+  --plan configs/stage2_corpus.yaml
 ```
 
 Stage 1 and Stage 2 use remote `manifest.json` files as commit markers. Re-running the same config skips committed source units.
@@ -159,9 +158,9 @@ python audit_splits.py \
 Stage 2 records exact and normalized hash sidecars in the shared dedup
 namespace. Optional SimHash near-duplicate rejection is controlled by
 `deduplication.near_duplicate.enabled` and is disabled by default until
-its false-positive rate is reviewed. Dataset `source_priority` values are
-recorded in manifests; higher-priority sources should be processed first when
-building a shared dedup namespace.
+its false-positive rate is reviewed. When disabled, no SimHash is computed.
+Dataset `source_priority` values are recorded in manifests, and the canonical
+Stage-2 driver processes the full corpus in deterministic priority order.
 
 Stage 3 assigns `train`, `validation`, `test`, `held_out_source`, `temporal`,
 `synthetic`, or `sealed` using the precedence in `configs/common.yaml`. Stage
@@ -223,39 +222,42 @@ runtime:
 ```
 
 Stage 1 uses bounded file scheduling and the configured temporary/cache roots.
-Stage 2 and Stage 3 remain source-sequential because their deduplication and
-decontamination state is global. Separate download/upload worker pools are
-reserved for a later overlapped-I/O milestone; they are not implied to be
-active by the current profile.
+Stage 2 currently applies global deduplication in canonical priority order.
+Use `stage2_corpus.py` rather than launching individual Stage-2 configs;
+`stage2_process.py --allow-standalone` is intentionally recovery-only.
+Separate download/upload worker pools are reserved for a later overlapped-I/O
+milestone; they are not implied to be active by the current profile.
 
-## Process each dataset independently
+## Process Stage 1 per dataset, then Stage 2 as one corpus
 
 FinePDFs-Edu:
 
 ```bash
 python stage1_filter.py --config configs/stage1/finepdfs_edu.yaml
-python stage2_process.py --config configs/stage2/finepdfs_edu.yaml
 ```
 
 FineMath:
 
 ```bash
 python stage1_filter.py --config configs/stage1/finemath.yaml
-python stage2_process.py --config configs/stage2/finemath.yaml
 ```
 
 Stack-Edu:
 
 ```bash
 python stage1_filter.py --config configs/stage1/stack_edu.yaml
-python stage2_process.py --config configs/stage2/stack_edu.yaml
 ```
 
 Dolma 3 150B sample (JSONL+zstd ingestion is supported):
 
 ```bash
 python stage1_filter.py --config configs/stage1/dolma3_150b.yaml
-python stage2_process.py --config configs/stage2/dolma3_150b.yaml
+```
+
+Once all intended Stage-1 sources are committed, run Stage 2 exactly once:
+
+```bash
+python stage2_corpus.py --plan configs/stage2_corpus.yaml
 ```
 
 ## Cross-dataset exact dedup
@@ -263,20 +265,23 @@ python stage2_process.py --config configs/stage2/dolma3_150b.yaml
 Every Stage-2 config currently uses:
 
 ```yaml
-dedup_namespace: "laughlm-hq-v1"
+dedup_namespace: "laughlm-hq-v2"
 ```
 
 The local DB is automatically stored at:
 
 ```text
-./work/dedup/laughlm-hq-v1.sqlite3
+./work/dedup/laughlm-hq-v2.sqlite3
 ```
 
-Before processing a dataset, Stage 2 scans registered Stage-2 repos for committed manifests in the same namespace and reconstructs the local exact-hash DB from their `accepted.hashes` sidecars. HF therefore remains the durable dedup record.
+The canonical driver shares one local exact-hash DB across the ordered source
+set. Hugging Face manifests and `accepted.hashes` sidecars remain the durable
+record, so a rerun resumes committed sources safely.
 
 **Important:** treat the namespace as immutable. If you materially change Stage-2 filtering rules and want a fresh corpus generation, bump ALL participating Stage-2 configs to e.g. `laughlm-hq-v2`.
 
-Processing order determines which identical copy wins. Process preferred/highest-quality sources first if exact duplicates overlap.
+Processing order determines which identical copy wins. The canonical plan owns
+that order: highest source priority first, then dataset name for ties.
 
 ## Stage 3: benchmark decontamination
 

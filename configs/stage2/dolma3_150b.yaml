@@ -1,6 +1,6 @@
 stage: 2
 dataset: dolma3_150b
-dedup_namespace: "laughlm-hq-v1"
+dedup_namespace: "laughlm-hq-v2"
 stage1_config: "../stage1/dolma3_150b.yaml"
 text_column: text
 id_column: id
