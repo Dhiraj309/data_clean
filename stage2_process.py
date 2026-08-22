@@ -340,14 +340,27 @@ class CrashSafeDedupStep(PipelineStep):
                 return iter(kept)
             for doc in data:
                 docs.append(doc)
-                identities.append(
-                    document_identity(
-                        doc.text,
-                        self.algorithm,
-                        self.identity_policy,
-                        include_near_fingerprint=self.near_enabled,
+                candidate_metadata = doc.metadata or {}
+                candidate_exact = candidate_metadata.get("_stage2_exact_digest")
+                candidate_normalized = candidate_metadata.get("_stage2_normalized_digest")
+                if candidate_exact is not None and candidate_normalized is not None:
+                    candidate_near = candidate_metadata.get("_stage2_near_fingerprint")
+                    identities.append(
+                        DocumentIdentity(
+                            exact_digest=bytes(candidate_exact),
+                            normalized_digest=bytes(candidate_normalized),
+                            near_fingerprint=(int(candidate_near) if candidate_near is not None else None),
+                        )
                     )
-                )
+                else:
+                    identities.append(
+                        document_identity(
+                            doc.text,
+                            self.algorithm,
+                            self.identity_policy,
+                            include_near_fingerprint=self.near_enabled,
+                        )
+                    )
                 if len(docs) >= self.batch_size:
                     yield from flush()
             yield from flush()

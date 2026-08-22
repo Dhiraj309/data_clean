@@ -97,7 +97,8 @@ runtime:
 - [x] Record Stage-2 per-input-part download and processing timings.
 - [x] Add a canonical corpus driver that enforces source-priority ordering.
 - [x] Version the dedup namespace after the non-canonical smoke attempt.
-- [ ] Add resumable parallel map/reduce execution for Stage 2 on multi-core VMs.
+- [x] Add deterministic parallel-map / ordered-reduce execution for Stage 2 on multi-core VMs.
+- [x] Persist reusable remote candidate artifacts and source-level timing summaries.
 - [ ] Benchmark and freeze a 24-core resource profile against a representative corpus slice.
 
 ## Implementation order

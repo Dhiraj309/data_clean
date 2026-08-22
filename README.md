@@ -117,8 +117,9 @@ python stage1_filter.py \
   --limit-files 10 \
   --workers 2
 
-python stage2_corpus.py \
-  --plan configs/stage2_corpus.yaml
+python stage2_parallel.py \
+  --plan configs/stage2_corpus.yaml \
+  --workers 6
 ```
 
 Stage 1 and Stage 2 use remote `manifest.json` files as commit markers. Re-running the same config skips committed source units.
@@ -222,9 +223,14 @@ runtime:
 ```
 
 Stage 1 uses bounded file scheduling and the configured temporary/cache roots.
-Stage 2 currently applies global deduplication in canonical priority order.
-Use `stage2_corpus.py` rather than launching individual Stage-2 configs;
+Stage 2 applies global deduplication in canonical priority order. Its parallel
+map workers perform document-local filtering and hashing; one ordered reducer
+makes all dedup decisions. Use `stage2_parallel.py` rather than launching
+individual Stage-2 configs;
 `stage2_process.py --allow-standalone` is intentionally recovery-only.
+Each mapped input part is committed to the Stage-2 repository before reduction,
+so an interrupted VM can reuse verified candidates. Final committed sources
+restore their hash sidecars before lower-priority sources continue.
 Separate download/upload worker pools are reserved for a later overlapped-I/O
 milestone; they are not implied to be active by the current profile.
 
@@ -257,8 +263,13 @@ python stage1_filter.py --config configs/stage1/dolma3_150b.yaml
 Once all intended Stage-1 sources are committed, run Stage 2 exactly once:
 
 ```bash
-python stage2_corpus.py --plan configs/stage2_corpus.yaml
+python stage2_parallel.py --plan configs/stage2_corpus.yaml --workers 6
 ```
+
+For a 24-core VM, begin with `--workers 6`, inspect the Stage-2 timings and
+memory/disk headroom, then try `--workers 8`. Do not set workers equal to CPU
+cores: each worker holds a bounded candidate buffer and competes for download,
+Parquet, and compression bandwidth.
 
 ## Cross-dataset exact dedup
 
