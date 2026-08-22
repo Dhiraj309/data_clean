@@ -35,7 +35,9 @@ def audit_repository(
     files = set(list_repo_files(api, repo_id, token, common))
     manifest_paths = sorted(
         path for path in files
-        if path.endswith("/manifest.json") and (not prefix or path.startswith(prefix))
+        if path.endswith("/manifest.json")
+        and "/map/" not in path  # Stage-2 parallel map checkpoints are internal, not final stage artifacts.
+        and (not prefix or path.startswith(prefix))
     )
     issues: List[Dict[str, Any]] = []
     valid = 0
