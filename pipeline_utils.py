@@ -225,6 +225,23 @@ def upload_file(api: HfApi, repo_id: str, local_path: Path, remote_path: str, to
         )
 
 
+def upload_folder(api: HfApi, repo_id: str, local_dir: Path, remote_dir: str, token: str, common: Dict[str, Any]) -> None:
+    """Publish a directory in one Hub commit to avoid commit-rate exhaustion."""
+    with _io_gate(common, "upload").slot():
+        retry_call(
+            lambda: api.upload_folder(
+                repo_id=repo_id,
+                repo_type="dataset",
+                folder_path=str(local_dir),
+                path_in_repo=remote_dir,
+                token=token,
+                commit_message=f"Upload {remote_dir}",
+            ),
+            common["retry"]["upload"],
+            f"upload-folder:{repo_id}:{remote_dir}",
+        )
+
+
 def download_file(
     repo_id: str,
     filename: str,

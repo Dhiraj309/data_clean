@@ -99,6 +99,7 @@ runtime:
 - [x] Version the dedup namespace after the non-canonical smoke attempt.
 - [x] Add deterministic parallel-map / ordered-reduce execution for Stage 2 on multi-core VMs.
 - [x] Persist reusable remote candidate artifacts and source-level timing summaries.
+- [x] Batch candidate and final-source publication to avoid Hub commit-rate exhaustion.
 - [ ] Benchmark and freeze a 24-core resource profile against a representative corpus slice.
 
 ## Implementation order

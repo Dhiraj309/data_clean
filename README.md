@@ -231,6 +231,8 @@ individual Stage-2 configs;
 Each mapped input part is committed to the Stage-2 repository before reduction,
 so an interrupted VM can reuse verified candidates. Final committed sources
 restore their hash sidecars before lower-priority sources continue.
+Candidate-part folders and each final source are uploaded as single Hub commits
+to stay below Hugging Face repository commit-rate limits.
 Separate download/upload worker pools are reserved for a later overlapped-I/O
 milestone; they are not implied to be active by the current profile.
 

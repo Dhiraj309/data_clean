@@ -8,6 +8,7 @@ can never select the winner of a duplicate family.
 from __future__ import annotations
 
 import argparse
+import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -24,7 +25,7 @@ import filters as custom_filters
 from config_loader import load_stage_bundle, stage2_semantic_hash
 from document_identity import document_identity
 from manifest_contract import build_artifact_contract, validate_committed_manifest
-from pipeline_utils import download_file, ensure_repo, file_detail, hf_token, list_repo_files, local_work_root, read_remote_json, setup_logging, slug, upload_file, utc_now, write_json
+from pipeline_utils import download_file, ensure_repo, file_detail, hf_token, list_repo_files, local_work_root, read_remote_json, setup_logging, slug, upload_folder, utc_now, write_json
 from stage2_process import (
     CommittedHashStore,
     CrashSafeDedupStep,
@@ -146,17 +147,19 @@ def _map_one_part(task: Dict[str, Any]) -> Dict[str, Any]:
         "metrics": metrics,
     }
     candidate_prefix = task["candidate_prefix"]
-    api = HfApi(token=token)
     remote_candidates = []
+    publish = work / "publish"
+    shutil.rmtree(publish, ignore_errors=True)
+    publish.mkdir(parents=True, exist_ok=True)
     for candidate in sink.paths:
         remote = f"{candidate_prefix}/{candidate.name}"
-        upload_file(api, dataset["repos"]["stage2"], candidate, remote, token, common)
+        shutil.copy2(candidate, publish / candidate.name)
         remote_candidates.append(remote)
     result["candidate_remote_parts"] = remote_candidates
     result["processing_status"] = "committed"
-    manifest_path = work / "map_manifest.json"
+    manifest_path = publish / "manifest.json"
     write_json(manifest_path, result)
-    upload_file(api, dataset["repos"]["stage2"], manifest_path, f"{candidate_prefix}/manifest.json", token, common)
+    upload_folder(HfApi(token=token), dataset["repos"]["stage2"], publish, candidate_prefix, token, common)
     local.unlink(missing_ok=True)
     return result
 
@@ -314,21 +317,24 @@ def commit_reduced_source(
     upload_started = time.perf_counter()
     output_parts: List[str] = []
     output_details: List[Dict[str, Any]] = []
+    publish = Path(reduced["work"]) / "publish"
+    shutil.rmtree(publish, ignore_errors=True)
+    publish.mkdir(parents=True, exist_ok=True)
     for local_path in map(Path, reduced["parts"]):
         remote = f"{prefix}/{local_path.name}"
         output_details.append(file_detail(local_path, common["hashing"]["algorithm"], remote_path=remote))
-        upload_file(api, dataset["repos"]["stage2"], local_path, remote, token, common)
+        shutil.copy2(local_path, publish / local_path.name)
         output_parts.append(remote)
     sidecar = Path(reduced["sidecar"])
     normalized = Path(reduced["normalized_sidecar"])
     side_remote = f"{prefix}/accepted.hashes"
     normalized_remote = f"{prefix}/accepted.normalized.hashes"
-    upload_file(api, dataset["repos"]["stage2"], sidecar, side_remote, token, common)
-    upload_file(api, dataset["repos"]["stage2"], normalized, normalized_remote, token, common)
+    shutil.copy2(sidecar, publish / sidecar.name)
+    shutil.copy2(normalized, publish / normalized.name)
     near_remote = None
     if reduced["near_sidecar"]:
         near_remote = f"{prefix}/accepted.near.hashes"
-        upload_file(api, dataset["repos"]["stage2"], Path(reduced["near_sidecar"]), near_remote, token, common)
+        shutil.copy2(Path(reduced["near_sidecar"]), publish / "accepted.near.hashes")
     timings["upload_seconds"] = time.perf_counter() - upload_started
     timings["total_seconds"] = timings["map_seconds"] + timings["reduce_seconds"] + timings["upload_seconds"]
     metrics = reduced["metrics"]
@@ -356,9 +362,9 @@ def commit_reduced_source(
         "counts": {"seen": metrics["seen"], "accepted": metrics["accepted"], "rejected": metrics["custom_rejected"], "duplicates": metrics["duplicates"], "near_duplicates": metrics["near_duplicates"], "errors": 0, "rejected_by_reason": dict(sorted(metrics["rejected_by_reason"].items())), "duplicate_by_reason": dict(sorted(metrics["duplicate_by_reason"].items())), "errors_by_reason": {}},
         "output_parts": output_parts, "output_part_details": output_details, "parallel_map": {"workers": len(mapped_parts), "parts": [{"ordinal": item["ordinal"], "candidate_rows": item["candidate_rows"]} for item in mapped_parts]}, "timings": {name: round(value, 3) for name, value in timings.items()}, "committed_at": utc_now(),
     }
-    manifest_path = Path(reduced["work"]) / "manifest.json"
+    manifest_path = publish / "manifest.json"
     write_json(manifest_path, manifest)
-    upload_file(api, dataset["repos"]["stage2"], manifest_path, f"{prefix}/manifest.json", token, common)
+    upload_folder(api, dataset["repos"]["stage2"], publish, prefix, token, common)
     store.commit_sidecars(key, f"{prefix}/manifest.json", sidecar, normalized, Path(reduced["near_sidecar"]) if reduced["near_sidecar"] else None, digest_size)
     return {"source": stage1_manifest["source_file"], "status": "processed", **metrics}
 
