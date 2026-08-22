@@ -237,8 +237,8 @@ def upload_folder(api: HfApi, repo_id: str, local_dir: Path, remote_dir: str, to
                 token=token,
                 commit_message=f"Upload {remote_dir}",
             ),
-            common["retry"]["upload"],
-            f"upload-folder:{repo_id}:{remote_dir}",
+            op_name=f"upload-folder:{repo_id}:{remote_dir}",
+            **retry_kwargs(common, "upload"),
         )
 
 
