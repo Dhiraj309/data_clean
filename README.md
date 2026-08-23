@@ -19,6 +19,7 @@ laughlm_dataset_pipeline_v5/
 ├── stage2_process.py
 ├── stage3_decontam.py
 ├── stage4_build.py
+├── verify_lighteval_tasks.py
 └── configs/
     ├── common.yaml
     ├── datasets.yaml
@@ -305,7 +306,17 @@ First edit:
 configs/stage3/benchmarks.yaml
 ```
 
-and fill `lighteval_tasks` with the final LaughLM evaluation suite. Freeze the
+and fill `lighteval_tasks` with the final LaughLM evaluation suite. Before
+freezing, verify every identifier against the exact installed Lighteval release:
+
+```bash
+python verify_lighteval_tasks.py \
+  --benchmark-config configs/stage3/benchmarks.yaml \
+  --output reports/lighteval_task_audit.json
+```
+
+This is a task-registry preflight only; it does not evaluate a model or process
+training data. Freeze the
 benchmark and sealed repository contract without mutating the drafts:
 
 ```bash
