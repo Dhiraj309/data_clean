@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import fnmatch
 from itertools import chain
 from pathlib import Path
 from typing import Any, Iterable
@@ -13,7 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 from datasets import load_dataset
-from huggingface_hub import HfApi, hf_hub_url
+from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
 
 
 OUTPUT_SCHEMA = pa.schema(
@@ -127,6 +128,60 @@ def stream_parquet_prefix(api: HfApi, source: dict[str, Any], token: str):
         streaming=True,
         token=token,
     )
+
+
+def list_hf_parquet_files(api: HfApi, source: dict[str, Any], token: str) -> list[str]:
+    """List source Parquet files without downloading the source dataset."""
+    repo_id = source["repo_id"]
+    revision = source.get("revision", "main")
+    prefix = source.get("path_prefix", "").strip("/")
+    pattern = source.get("file_pattern", "*.parquet")
+    files = api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision=revision, token=token)
+    result = []
+    for filename in files:
+        normalized = filename.strip("/")
+        if prefix and not (normalized == prefix or normalized.startswith(prefix + "/")):
+            continue
+        if fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(normalized.rsplit("/", 1)[-1], pattern):
+            result.append(normalized)
+    if not result:
+        raise RuntimeError(f"No Parquet files found in {repo_id} for prefix={prefix!r} pattern={pattern!r}")
+    return sorted(result)
+
+
+def stream_hf_parquet_file(source: dict[str, Any], filename: str, token: str):
+    """Stream exactly one HF Parquet file."""
+    url = hf_hub_url(
+        source["repo_id"],
+        filename=filename,
+        repo_type="dataset",
+        revision=source.get("revision", "main"),
+    )
+    return load_dataset(
+        "parquet",
+        data_files={"train": [url]},
+        split="train",
+        streaming=True,
+        token=token,
+    )
+
+
+def download_json_if_present(repo_id: str, filename: str, revision: str, token: str) -> dict[str, Any] | None:
+    """Load a remote checkpoint; return None only when that checkpoint is absent."""
+    try:
+        local = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type="dataset",
+            revision=revision,
+            token=token,
+        )
+    except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 404 or "Entry Not Found" in str(exc):
+            return None
+        raise
+    return json.loads(Path(local).read_text(encoding="utf-8"))
 
 
 def ensure_dataset_repo(api: HfApi, repo_id: str, token: str, private: bool = True) -> None:
