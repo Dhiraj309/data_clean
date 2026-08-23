@@ -9,8 +9,6 @@ eos_token_id: null
 token_dtype: auto
 
 exact_budget: true
-target_tokens: 10_000_000_000
-tokens_per_shard: 250_000_000
 tokenizer_batch_size: 256
 seed: 309
 domain_quotas: {}
@@ -22,25 +20,39 @@ packing:
   eos_between_documents: true
   pad_to_multiple: null
 
-# 10B POC: same 20B/50B source proportions, scaled exactly by one half.
+# Source lineage. Exact per-output quotas are declared below.
 sources:
   dolma3_150b:
     stage3_config: "../stage3/dolma3_150b.yaml"
-    tokens: 4_000_000_000
-    allowed_splits: [train]
   finepdfs_edu:
     stage3_config: "../stage3/finepdfs_edu.yaml"
-    tokens: 2_000_000_000
-    allowed_splits: [train]
   fineweb_edu:
     stage3_config: "../stage3/fineweb_edu.yaml"
-    tokens: 1_500_000_000
-    allowed_splits: [train]
   stack_edu:
     stage3_config: "../stage3/stack_edu.yaml"
-    tokens: 1_500_000_000
-    allowed_splits: [train]
   finemath:
     stage3_config: "../stage3/finemath.yaml"
-    tokens: 1_000_000_000
+
+# Build each output separately with: stage4_build.py ... --output <name>.
+# The 100M validation corpus is held out by the deterministic Stage-3 split.
+outputs:
+  train:
+    target_tokens: 10_000_000_000
+    tokens_per_shard: 250_000_000
     allowed_splits: [train]
+    source_tokens:
+      dolma3_150b: 4_000_000_000
+      finepdfs_edu: 2_000_000_000
+      fineweb_edu: 1_500_000_000
+      stack_edu: 1_500_000_000
+      finemath: 1_000_000_000
+  validation:
+    target_tokens: 100_000_000
+    tokens_per_shard: 50_000_000
+    allowed_splits: [validation]
+    source_tokens:
+      dolma3_150b: 40_000_000
+      finepdfs_edu: 20_000_000
+      fineweb_edu: 15_000_000
+      stack_edu: 15_000_000
+      finemath: 10_000_000

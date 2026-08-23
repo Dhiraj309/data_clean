@@ -108,6 +108,49 @@ def token_dtype(tokenizer: Tokenizer, configured: str) -> np.dtype:
     return np.dtype("<u2" if vocab <= 65536 else "<u8")
 
 
+def resolve_output_spec(mix: Dict[str, Any], output_name: str) -> Dict[str, Any]:
+    """Normalize a named Stage-4 output, retaining legacy single-output recipes."""
+    outputs = mix.get("outputs")
+    if outputs is None:
+        if output_name != "train":
+            raise ValueError("Legacy Stage-4 recipes only define the 'train' output")
+        source_tokens = {name: int(spec["tokens"]) for name, spec in mix["sources"].items()}
+        return {
+            "name": "train",
+            "target_tokens": int(mix["target_tokens"]),
+            "tokens_per_shard": int(mix.get("tokens_per_shard", 250_000_000)),
+            "allowed_splits": None,
+            "source_tokens": source_tokens,
+        }
+    if not isinstance(outputs, dict) or output_name not in outputs:
+        raise ValueError(f"Stage-4 output {output_name!r} is not defined; available={sorted(outputs or {})}")
+    spec = dict(outputs[output_name] or {})
+    source_tokens = {str(name): int(value) for name, value in (spec.get("source_tokens") or {}).items()}
+    expected_sources = set(mix["sources"])
+    if set(source_tokens) != expected_sources:
+        raise ValueError(
+            f"Output {output_name!r} must define source_tokens for exactly "
+            f"{sorted(expected_sources)}; got {sorted(source_tokens)}"
+        )
+    target = int(spec.get("target_tokens", 0))
+    if target <= 0 or any(tokens < 0 for tokens in source_tokens.values()):
+        raise ValueError(f"Output {output_name!r} must have positive target_tokens and non-negative source quotas")
+    if sum(source_tokens.values()) != target:
+        raise ValueError(
+            f"Output {output_name!r} source quotas sum to {sum(source_tokens.values())}, expected {target}"
+        )
+    allowed_splits = list(spec.get("allowed_splits") or [])
+    if not allowed_splits:
+        raise ValueError(f"Output {output_name!r} must define a non-empty allowed_splits list")
+    return {
+        "name": output_name,
+        "target_tokens": target,
+        "tokens_per_shard": int(spec.get("tokens_per_shard", mix.get("tokens_per_shard", 250_000_000))),
+        "allowed_splits": allowed_splits,
+        "source_tokens": source_tokens,
+    }
+
+
 def list_stage3_parts(source_bundle: Dict[str, Any], api: HfApi, token: str, common: Dict[str, Any]) -> List[SourcePart]:
     dataset = source_bundle["dataset"]
     repo = dataset["repos"]["stage3"]
@@ -329,6 +372,7 @@ def main() -> None:
     parser.add_argument("--config", required=True, help="configs/stage4/<mixture>.yaml")
     parser.add_argument("--common", default=None)
     parser.add_argument("--registry", default=None)
+    parser.add_argument("--output", default="train", help="Named output from config.outputs (default: train)")
     parser.add_argument("--limit-parts-per-dataset", type=int, default=None, help="Testing only")
     parser.add_argument("--fresh", action="store_true", help="Ignore an existing progress marker")
     parser.add_argument("--dry-run", action="store_true")
@@ -340,10 +384,9 @@ def main() -> None:
     token = hf_token(common); api = HfApi(token=token)
     ensure_repo(api, mix["output_repo"], token, common)
 
-    quotas = {name: int(info["spec"]["tokens"]) for name, info in bundle["sources"].items()}
-    target = int(mix["target_tokens"])
-    if sum(quotas.values()) != target:
-        raise ValueError(f"Source quotas sum to {sum(quotas.values())}, target_tokens={target}")
+    output = resolve_output_spec(mix, args.output)
+    quotas = dict(output["source_tokens"])
+    target = int(output["target_tokens"])
     domain_quotas = quota_map("domain_quotas", mix.get("domain_quotas"))
     time_quotas = quota_map("time_quotas", mix.get("time_quotas"))
     validate_dimension_quotas("domain", domain_quotas, bundle["sources"], quotas)
@@ -356,7 +399,9 @@ def main() -> None:
         if args.limit_parts_per_dataset is not None:
             parts = parts[: args.limit_parts_per_dataset]
         parts_by_dataset[name] = parts
-        allowed_splits_by_dataset[name] = list(info["spec"].get("allowed_splits", ["train"]))
+        allowed_splits_by_dataset[name] = list(
+            output["allowed_splits"] or info["spec"].get("allowed_splits", ["train"])
+        )
 
     table = Table(title=f"Stage 4 — {mix['name']}")
     table.add_column("Dataset"); table.add_column("Quota"); table.add_column("Stage-3 parts")
@@ -377,9 +422,10 @@ def main() -> None:
     packing_contract_data = packing_contract(mix)
     contract = {
         "mixture_hash": bundle["mixture_hash"],
+        "output_name": output["name"],
         "tokenizer": tokenizer_contract_data,
         "packing": packing_contract_data,
-        "tokens_per_shard": int(mix.get("tokens_per_shard", 250_000_000)),
+        "tokens_per_shard": int(output["tokens_per_shard"]),
         "source_quotas": quotas,
         "domain_quotas": domain_quotas,
         "time_quotas": time_quotas,
@@ -387,8 +433,8 @@ def main() -> None:
     }
     contract_hash = stable_hash(contract)
     rng = random.Random(int(mix.get("seed", 309)))
-    work = local_work_root(common) / "stage4" / bundle["mixture_hash"][:12]
-    remote_prefix = f"runs/{bundle['mixture_hash'][:12]}"
+    work = local_work_root(common) / "stage4" / bundle["mixture_hash"][:12] / output["name"]
+    remote_prefix = f"runs/{bundle['mixture_hash'][:12]}/{output['name']}"
     progress_remote = f"{remote_prefix}/progress.json"
     corpus_remote = f"{remote_prefix}/corpus_manifest.json"
     existing_output_files = set(list_repo_files(api, mix["output_repo"], token, common))
@@ -439,6 +485,7 @@ def main() -> None:
             "processing_status": "in_progress",
             "contract_hash": contract_hash,
             "mixture_hash": bundle["mixture_hash"],
+            "output_name": output["name"],
             "completed_shards": len(current_writer.shards),
             "written_tokens": current_writer.total_tokens,
             "source_tokens_written": consumed,
@@ -451,7 +498,7 @@ def main() -> None:
 
     writer = BinaryShardWriter(
         mix["output_repo"], remote_prefix, work / "tokens",
-        int(mix.get("tokens_per_shard", 250_000_000)), dtype, api, token, common,
+        int(output["tokens_per_shard"]), dtype, api, token, common,
         start_index=completed_shards,
         initial_total_tokens=resume_tokens,
         initial_shards=initial_shards,
@@ -565,6 +612,7 @@ def main() -> None:
         "version": 1,
         "stage": 4,
         "name": mix["name"],
+        "output_name": output["name"],
         "mixture_hash": bundle["mixture_hash"],
         "tokenizer": mix["tokenizer_name_or_path"],
         "tokenizer_contract": tokenizer_contract_data,
@@ -587,14 +635,24 @@ def main() -> None:
         "allowed_splits_by_source": allowed_splits_by_dataset,
         "split_policy_version": (common.get("splits") or {}).get("version", 1),
         "processing_status": "committed",
-        "tokens_per_shard": int(mix.get("tokens_per_shard", 250_000_000)),
+        "tokens_per_shard": int(output["tokens_per_shard"]),
         "shards": writer.shards,
         "committed_at": utc_now(),
     }
     manifest_path = work / "corpus_manifest.json"; write_json(manifest_path, manifest)
     upload_file(api, mix["output_repo"], manifest_path, f"{remote_prefix}/corpus_manifest.json", token, common)
     # Small pointer; a new mixture hash never overwrites old token shards.
-    active = work / "ACTIVE.json"; write_json(active, {"mixture_hash": bundle["mixture_hash"], "manifest": f"{remote_prefix}/corpus_manifest.json"})
+    active_payload = {"mixture_hash": bundle["mixture_hash"], "outputs": {}}
+    if "ACTIVE.json" in existing_output_files:
+        previous = read_remote_json(mix["output_repo"], "ACTIVE.json", token, common)
+        if previous.get("mixture_hash") == bundle["mixture_hash"]:
+            active_payload = previous
+            active_payload.setdefault("outputs", {})
+    active_payload["outputs"][output["name"]] = {
+        "manifest": f"{remote_prefix}/corpus_manifest.json",
+        "contract_hash": contract_hash,
+    }
+    active = work / "ACTIVE.json"; write_json(active, active_payload)
     upload_file(api, mix["output_repo"], active, "ACTIVE.json", token, common)
     Console().print(f"[green]Stage 4 complete[/green]: {writer.total_tokens:,} tokens, {len(writer.shards)} shards")
 

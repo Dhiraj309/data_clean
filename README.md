@@ -19,6 +19,7 @@ laughlm_dataset_pipeline_v5/
 ├── stage2_process.py
 ├── stage3_decontam.py
 ├── stage4_build.py
+├── stage4_capacity_preflight.py
 ├── verify_lighteval_tasks.py
 └── configs/
     ├── common.yaml
@@ -380,16 +381,32 @@ domain_quotas: {}
 time_quotas: {}
 ```
 
-Validate availability without tokenizing:
+Estimate post-Stage-3 capacity with a bounded tokenized sample before launching
+the full exact-budget build:
 
 ```bash
-python stage4_build.py --config configs/stage4/laughlm_hq_10b_poc.yaml --dry-run
+python stage4_capacity_preflight.py \
+  --config configs/stage4/laughlm_hq_10b_poc.yaml \
+  --output train \
+  --sample-parts-per-source 2 \
+  --output-report reports/10b_train_capacity.json
 ```
 
-Build:
+The estimate is a launch guard, not an exact capacity proof. Repeat it for the
+validation output before materializing either split.
+
+Validate Stage-3 artifact availability without tokenizing:
 
 ```bash
-python stage4_build.py --config configs/stage4/laughlm_hq_10b_poc.yaml
+python stage4_build.py --config configs/stage4/laughlm_hq_10b_poc.yaml --output train --dry-run
+python stage4_build.py --config configs/stage4/laughlm_hq_10b_poc.yaml --output validation --dry-run
+```
+
+Build the two isolated outputs:
+
+```bash
+python stage4_build.py --config configs/stage4/laughlm_hq_10b_poc.yaml --output train
+python stage4_build.py --config configs/stage4/laughlm_hq_10b_poc.yaml --output validation
 ```
 
 Stage 4 interleaves documents across source datasets using remaining source and
@@ -397,6 +414,9 @@ optional domain/time quotas, tokenizes them, adds EOS, enforces exact quotas,
 and writes memory-mappable little-endian uint16/uint64 `.bin` shards. `auto`
 uses uint16 through a 65,536-token vocabulary and uint64 above that limit. The final
 manifest records declared and observed exposure for each quota dimension.
+Each named output receives its own resumable manifest and shard directory under
+`runs/<mixture-hash>/<output>/`. `ACTIVE.json` records all completed outputs
+for the active mixture.
 
 Final output layout:
 
