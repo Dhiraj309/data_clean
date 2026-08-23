@@ -336,6 +336,16 @@ Update each Stage-3 config to reference `benchmarks.frozen.yaml` before
 processing. The resulting freeze manifest records the benchmark and sealed
 configuration hashes.
 
+Before the first full Stage-1 run, validate the intended production mixture.
+This fails on unresolved tokenizer/EOS placeholders or Stage-3 contracts that
+are not frozen:
+
+```bash
+python validate_configs.py \
+  --registry configs/generated/production/datasets.yaml \
+  --production-stage4 configs/stage4/laughlm_hq_10b_poc.yaml
+```
+
 Build the shared index once:
 
 ```bash
