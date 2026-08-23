@@ -101,11 +101,11 @@ def token_dtype(tokenizer: Tokenizer, configured: str) -> np.dtype:
         if vocab > 65536:
             raise ValueError(f"Tokenizer vocab {vocab} does not fit uint16")
         return np.dtype("<u2")
-    if configured == "uint32":
-        return np.dtype("<u4")
+    if configured == "uint64":
+        return np.dtype("<u8")
     if configured != "auto":
-        raise ValueError("token_dtype must be auto, uint16, or uint32")
-    return np.dtype("<u2" if vocab <= 65536 else "<u4")
+        raise ValueError("token_dtype must be auto, uint16, or uint64")
+    return np.dtype("<u2" if vocab <= 65536 else "<u8")
 
 
 def list_stage3_parts(source_bundle: Dict[str, Any], api: HfApi, token: str, common: Dict[str, Any]) -> List[SourcePart]:

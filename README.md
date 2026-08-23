@@ -42,6 +42,7 @@ laughlm_dataset_pipeline_v5/
     │   ├── stack_edu.yaml
     │   └── dolma3_150b.yaml
     └── stage4/
+        ├── laughlm_hq_10b_poc.yaml
         ├── laughlm_hq_20b.yaml
         └── laughlm_hq_50b.yaml
 ```
@@ -346,9 +347,10 @@ The benchmark hash is part of Stage-3 lineage, so changing `benchmarks.yaml` cre
 
 ## Stage 4: combine datasets only here
 
-Freeze the LaughLM tokenizer and EOS first, then edit either:
+Freeze the LaughLM tokenizer and EOS first, then select a mixture recipe:
 
 ```text
+configs/stage4/laughlm_hq_10b_poc.yaml
 configs/stage4/laughlm_hq_20b.yaml
 configs/stage4/laughlm_hq_50b.yaml
 ```
@@ -370,18 +372,19 @@ time_quotas: {}
 Validate availability without tokenizing:
 
 ```bash
-python stage4_build.py --config configs/stage4/laughlm_hq_20b.yaml --dry-run
+python stage4_build.py --config configs/stage4/laughlm_hq_10b_poc.yaml --dry-run
 ```
 
 Build:
 
 ```bash
-python stage4_build.py --config configs/stage4/laughlm_hq_20b.yaml
+python stage4_build.py --config configs/stage4/laughlm_hq_10b_poc.yaml
 ```
 
 Stage 4 interleaves documents across source datasets using remaining source and
 optional domain/time quotas, tokenizes them, adds EOS, enforces exact quotas,
-and writes memory-mappable little-endian uint16/uint32 `.bin` shards. The final
+and writes memory-mappable little-endian uint16/uint64 `.bin` shards. `auto`
+uses uint16 through a 65,536-token vocabulary and uint64 above that limit. The final
 manifest records declared and observed exposure for each quota dimension.
 
 Final output layout:
