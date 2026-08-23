@@ -1,5 +1,0 @@
-stage: 3
-dataset: finepdfs_edu
-stage2_config: "../stage2/finepdfs_edu.yaml"
-benchmark_config: "benchmarks.yaml"
-shard: {target_size_mb: 500, max_documents: 100000}

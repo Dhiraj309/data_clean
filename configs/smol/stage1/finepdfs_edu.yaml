@@ -1,0 +1,37 @@
+stage: 1
+name: finepdfs_edu
+
+source:
+  repo_id: "HuggingFaceFW/finepdfs-edu"
+  config: "eng_Latn"
+  revision: "main"
+  split: "train"
+
+columns:
+  text: text
+  id: id
+  url: url
+  language: language
+  language_score: language_score
+  token_count: token_count
+  dataset: dataset
+
+required_columns: [text, id, language]
+
+filters:
+  languages: [en]
+  min_language_score: 0.95
+  min_words: 50
+  max_words: 150000
+  min_chars: 200
+  max_chars: 750000
+  missing_policy: ignore
+
+output:
+  repo_id: "${HF_USER}/laughlm-smol-v1-stage1-finepdfs-edu"
+  private: true
+  run_id: "v1"
+  path_prefix: "data/v1"
+  target_size_mb: 256
+  max_documents: 1000000
+  local_dir: "work/smol_stage1"

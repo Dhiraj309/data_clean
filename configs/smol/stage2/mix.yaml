@@ -1,0 +1,32 @@
+stage: 2
+name: smol-v1-mix
+seed: 42
+
+# The initial Smol Data-style mixture: 50% FinePDFs-Edu, 30% DCLM, 20% FineWeb-Edu.
+# Change these weights without changing the Stage-1 filtering jobs.
+target_tokens: 20000000000
+sources:
+  - name: finepdfs_edu
+    repo_id: "${HF_USER}/laughlm-smol-v1-stage1-finepdfs-edu"
+    revision: main
+    path_prefix: data/v1
+    weight: 0.50
+  - name: dclm
+    repo_id: "${HF_USER}/laughlm-smol-v1-stage1-dclm"
+    revision: main
+    path_prefix: data/v1
+    weight: 0.30
+  - name: fineweb_edu
+    repo_id: "${HF_USER}/laughlm-smol-v1-stage1-fineweb-edu"
+    revision: main
+    path_prefix: data/v1
+    weight: 0.20
+
+output:
+  repo_id: "${HF_USER}/laughlm-smol-v1-training"
+  private: true
+  run_id: v1
+  path_prefix: data/v1
+  target_size_mb: 256
+  max_documents: 1000000
+  local_dir: work/smol_stage2

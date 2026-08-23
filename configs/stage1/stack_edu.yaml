@@ -1,9 +1,0 @@
-stage: 1
-dataset: stack_edu
-
-metadata_filters: []
-output_columns: "*"
-
-shard:
-  target_size_mb: 500
-  max_documents: 150000

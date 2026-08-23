@@ -1,0 +1,37 @@
+stage: 1
+name: dclm
+
+source:
+  repo_id: "mlfoundations/dclm-baseline-1.0-parquet"
+  revision: "main"
+  split: "train"
+
+columns:
+  text: text
+  id: id
+  url: url
+  language: language
+  language_score: language_score
+  fasttext_score: fasttext_score
+  dataset: dataset
+
+required_columns: [text, id, language, language_score, fasttext_score]
+
+filters:
+  languages: [en]
+  min_language_score: 0.95
+  min_fasttext_score: 0.20
+  min_words: 50
+  max_words: 100000
+  min_chars: 200
+  max_chars: 500000
+  missing_policy: reject
+
+output:
+  repo_id: "${HF_USER}/laughlm-smol-v1-stage1-dclm"
+  private: true
+  run_id: "v1"
+  path_prefix: "data/v1"
+  target_size_mb: 256
+  max_documents: 1000000
+  local_dir: "work/smol_stage1"
