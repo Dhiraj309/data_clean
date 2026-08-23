@@ -307,6 +307,7 @@ def commit_reduced_source(
     token: str,
     store: CommittedHashStore,
     timings: Dict[str, float],
+    requested_workers: int,
 ) -> Dict[str, Any]:
     """Publish reducer output with the same manifest-last contract as Stage 2."""
 
@@ -360,7 +361,13 @@ def commit_reduced_source(
         "rejected": metrics["custom_rejected"], "rejected_by_reason": dict(sorted(metrics["rejected_by_reason"].items())),
         "duplicate_by_reason": dict(sorted(metrics["duplicate_by_reason"].items())), "error_count": 0, "errors_by_reason": {},
         "counts": {"seen": metrics["seen"], "accepted": metrics["accepted"], "rejected": metrics["custom_rejected"], "duplicates": metrics["duplicates"], "near_duplicates": metrics["near_duplicates"], "errors": 0, "rejected_by_reason": dict(sorted(metrics["rejected_by_reason"].items())), "duplicate_by_reason": dict(sorted(metrics["duplicate_by_reason"].items())), "errors_by_reason": {}},
-        "output_parts": output_parts, "output_part_details": output_details, "parallel_map": {"workers": len(mapped_parts), "parts": [{"ordinal": item["ordinal"], "candidate_rows": item["candidate_rows"]} for item in mapped_parts]}, "timings": {name: round(value, 3) for name, value in timings.items()}, "committed_at": utc_now(),
+        "output_parts": output_parts, "output_part_details": output_details,
+        "parallel_map": {
+            "requested_workers": requested_workers,
+            "input_parts": len(mapped_parts),
+            "parts": [{"ordinal": item["ordinal"], "candidate_rows": item["candidate_rows"]} for item in mapped_parts],
+        },
+        "timings": {name: round(value, 3) for name, value in timings.items()}, "committed_at": utc_now(),
     }
     manifest_path = publish / "manifest.json"
     write_json(manifest_path, manifest)
@@ -440,6 +447,7 @@ def main() -> None:
                 result = commit_reduced_source(
                     bundle, manifest_path, stage1_manifest, mapped, reduced, api, token, store,
                     {"map_seconds": mapped_at - started, "reduce_seconds": reduced_at - mapped_at},
+                    args.workers,
                 )
                 print(result)
     finally:
