@@ -5,12 +5,20 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import random
 import time
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
+
 from huggingface_hub import HfApi
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
 
 from smol_pipeline import (
     ShardWriter,
@@ -45,6 +53,40 @@ def empty_state(sources: list[dict]) -> dict[str, Any]:
         "next_part": 0,
         "finished": False,
     }
+
+
+def mix_status_panel(
+    sources: list[dict],
+    counts: dict[str, int],
+    rows: int,
+    estimated_tokens: int,
+    target_tokens: int | None,
+    current_source: str,
+    status: str,
+) -> Panel:
+    summary = Table.grid(expand=True)
+    summary.add_column(style="cyan")
+    summary.add_column(justify="right")
+    summary.add_row("Status", status)
+    summary.add_row("Current source", current_source or "—")
+    summary.add_row("Rows", f"{rows:,}")
+    token_value = f"{estimated_tokens:,}"
+    if target_tokens:
+        token_value += f" / {int(target_tokens):,} ({100.0 * estimated_tokens / int(target_tokens):.2f}%)"
+    summary.add_row("Estimated tokens", token_value)
+
+    table = Table(expand=True, box=None, padding=(0, 1))
+    table.add_column("Source", ratio=3)
+    table.add_column("Rows", justify="right", width=14)
+    table.add_column("Actual %", justify="right", width=12)
+    table.add_column("Target %", justify="right", width=12)
+    total_weight = sum(float(source["weight"]) for source in sources)
+    for source in sources:
+        count = int(counts.get(source["name"], 0))
+        actual = (100.0 * count / rows) if rows else 0.0
+        target = 100.0 * float(source["weight"]) / total_weight
+        table.add_row(source["name"], f"{count:,}", f"{actual:.2f}%", f"{target:.2f}%")
+    return Panel(Group(summary, table), title="Stage 2 · weighted mixture", border_style="magenta")
 
 
 def load_state(local_state: Path, repo_id: str, remote_state: str, token: str, sources: list[dict]) -> dict[str, Any]:
@@ -83,15 +125,15 @@ def upload_pending(
     token: str,
     output_prefix: str,
     filename_prefix: str,
-) -> None:
+) -> str | None:
     if not pending_path.is_file():
-        return
+        return None
     pending = json.loads(pending_path.read_text(encoding="utf-8"))
     part = Path(pending["local_part"])
     if state.get("next_part", 0) > pending["part_index"]:
         pending_path.unlink(missing_ok=True)
         part.unlink(missing_ok=True)
-        return
+        return None
     if not part.is_file():
         raise RuntimeError(f"Checkpoint references missing local buffer: {part}")
     remote_part = (
@@ -102,6 +144,7 @@ def upload_pending(
     state.update(pending["state_after"])
     save_state(state, local_state, api, repo_id, remote_state, token, part=part)
     pending_path.unlink(missing_ok=True)
+    return remote_part
 
 
 def main() -> None:
@@ -132,15 +175,23 @@ def main() -> None:
     token = hf_token()
     api = HfApi(token=token)
     output = cfg["output"]
-    print({
-        "stage": 2,
-        "sources": [{"name": s["name"], "weight": s["weight"], "repo_id": s["repo_id"]} for s in sources],
-        "output_repo": output["repo_id"],
-        "target_tokens": args.target_tokens or cfg.get("target_tokens"),
-        "run_id": output.get("run_id", "v1"),
-        "resume": not args.no_resume,
-    })
+    console = Console()
     if args.dry_run:
+        plan = Table(expand=True, box=None, padding=(0, 1))
+        plan.add_column("Source")
+        plan.add_column("Repository", ratio=3)
+        plan.add_column("Folder")
+        plan.add_column("Weight", justify="right")
+        for source in sources:
+            plan.add_row(
+                source["name"], source["repo_id"], source.get("path_prefix", ""),
+                f"{100.0 * float(source['weight']) / total_weight:.2f}%",
+            )
+        plan.caption = (
+            f"Output: {output['repo_id']}/{output.get('path_prefix', '')} · "
+            f"Target tokens: {int(args.target_tokens or cfg.get('target_tokens') or 0):,}"
+        )
+        console.print(Panel(plan, title="Stage 2 dry-run", border_style="magenta"))
         return
 
     ensure_dataset_repo(api, output["repo_id"], token, private=bool(output.get("private", True)))
@@ -157,7 +208,7 @@ def main() -> None:
     )
     output_prefix_value = output.get("path_prefix", "data/" + run_id).rstrip("/")
     filename_prefix = str(output.get("filename_prefix", cfg.get("name", "training")))
-    upload_pending(
+    recovered_part = upload_pending(
         pending_path,
         state,
         local_state,
@@ -168,9 +219,22 @@ def main() -> None:
         output_prefix_value,
         filename_prefix,
     )
+    if recovered_part:
+        console.print(f"[green]Pushed[/green] {recovered_part} (recovered pending shard)")
     if state.get("finished"):
-        print(state)
+        console.print("[dim]Stage 2 is already complete; nothing to process.[/dim]")
         return
+
+    rows = int(state.get("rows", 0))
+    estimated_tokens = int(state.get("estimated_tokens", 0))
+    counts = dict(state.get("rows_by_source", {source["name"]: 0 for source in sources}))
+    target_tokens = args.target_tokens or cfg.get("target_tokens")
+    live = Live(
+        mix_status_panel(sources, counts, rows, estimated_tokens, target_tokens, "", "initializing"),
+        console=console,
+        refresh_per_second=2,
+    )
+    live.start()
 
     iterators = {source["name"]: iter(stream_parquet_prefix(api, source, token)) for source in sources}
     rng = random.Random(int(cfg.get("seed", 42)))
@@ -189,6 +253,13 @@ def main() -> None:
             exhausted.add(name)
             continue
         replayed += 1
+        if replayed % 4096 == 0:
+            live.update(
+                mix_status_panel(
+                    sources, counts, rows, estimated_tokens, target_tokens, name,
+                    f"replaying checkpoint {replayed:,}/{replay_rows:,}",
+                )
+            )
 
     writer = ShardWriter(
         local_root / "parts",
@@ -196,11 +267,9 @@ def main() -> None:
         max_documents=int(output.get("max_documents", 1_000_000)),
     )
     writer.index = int(state.get("next_part", 0))
-    rows = int(state.get("rows", 0))
-    estimated_tokens = int(state.get("estimated_tokens", 0))
-    counts = dict(state.get("rows_by_source", {source["name"]: 0 for source in sources}))
     started = time.perf_counter()
-    target_tokens = args.target_tokens or cfg.get("target_tokens")
+    last_status = started
+    live.update(mix_status_panel(sources, counts, rows, estimated_tokens, target_tokens, "", "mixing"))
 
     while True:
         if args.limit_rows is not None and rows >= int(args.limit_rows):
@@ -225,6 +294,14 @@ def main() -> None:
         rows += 1
         counts[name] = int(counts.get(name, 0)) + 1
         part = writer.add(row)
+        now = time.perf_counter()
+        if rows % 2048 == 0 or now - last_status >= 1.0:
+            live.update(
+                mix_status_panel(
+                    sources, counts, rows, estimated_tokens, target_tokens, name, "mixing"
+                )
+            )
+            last_status = now
         if part is None:
             continue
         part_index = writer.index - 1
@@ -240,10 +317,12 @@ def main() -> None:
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
         write_json(pending_path, {"local_part": str(part), "part_index": part_index, "state_after": state_after})
-        upload_pending(
+        remote_part = upload_pending(
             pending_path, state, local_state, api, output["repo_id"], remote_state,
             token, output_prefix_value, filename_prefix
         )
+        if remote_part:
+            console.print(f"[green]Pushed[/green] {remote_part}")
 
     part = writer.flush()
     if part is not None:
@@ -260,10 +339,12 @@ def main() -> None:
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
         write_json(pending_path, {"local_part": str(part), "part_index": part_index, "state_after": state_after})
-        upload_pending(
+        remote_part = upload_pending(
             pending_path, state, local_state, api, output["repo_id"], remote_state,
             token, output_prefix_value, filename_prefix
         )
+        if remote_part:
+            console.print(f"[green]Pushed[/green] {remote_part}")
 
     state.update({
         "stage": 2,
@@ -277,7 +358,14 @@ def main() -> None:
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     })
     save_state(state, local_state, api, output["repo_id"], remote_state, token)
-    print(state)
+    live.update(
+        mix_status_panel(sources, counts, rows, estimated_tokens, target_tokens, "", "complete")
+    )
+    live.stop()
+    console.print(
+        f"[bold green]Stage 2 complete[/bold green] · rows {rows:,} · "
+        f"estimated tokens {estimated_tokens:,}"
+    )
 
 
 if __name__ == "__main__":

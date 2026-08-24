@@ -7,6 +7,10 @@ This is the new lightweight path for Smol Data sources. It deliberately has only
 
 The pipeline does not download a whole source to local disk, does not run the old multi-pass corpus deduplication flow, and does not mix raw sources before filtering.
 
+## Minimal live logging
+
+Stage 1 keeps one live box on screen showing each active source file, its status, rows seen, accepted rows, and acceptance percentage. After a source file finishes, it prints one concise `Pushed` line instead of the complete checkpoint dictionary. Stage 2 uses one live box for total rows, estimated tokens, current source, and actual versus target mixture percentages, plus one line per uploaded output shard. Hugging Face download and upload progress bars are disabled by default so notebook logs stay compact.
+
 ## Environment
 
 From a fresh machine or Kaggle session, first clone the repository that contains this pipeline:

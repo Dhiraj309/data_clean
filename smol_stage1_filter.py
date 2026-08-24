@@ -10,10 +10,18 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from itertools import chain, islice
+from multiprocessing import Manager
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
+
 from huggingface_hub import HfApi
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
 
 from smol_pipeline import (
     accepts,
@@ -53,6 +61,59 @@ def empty_state() -> dict[str, Any]:
         "next_part": 0,
         "finished": False,
     }
+
+
+def publish_status(
+    job: dict[str, Any],
+    rows_seen: int,
+    accepted: int,
+    state: str,
+) -> None:
+    shared = job.get("status")
+    if shared is None:
+        return
+    shared[job["source_file"]] = {
+        "file": job["source_file"],
+        "rows_seen": int(rows_seen),
+        "accepted": int(accepted),
+        "acceptance": (100.0 * accepted / rows_seen) if rows_seen else 0.0,
+        "state": state,
+    }
+
+
+def status_panel(
+    domain: str,
+    statuses: Any,
+    completed: int,
+    total: int,
+) -> Panel:
+    values = list(dict(statuses).values())
+    active = [item for item in values if item.get("state") not in {"complete", "already complete"}]
+    table = Table(expand=True, box=None, padding=(0, 1))
+    table.add_column("File", ratio=5, overflow="ellipsis")
+    table.add_column("Status", width=12)
+    table.add_column("Seen", justify="right", width=12)
+    table.add_column("Accepted", justify="right", width=12)
+    table.add_column("Accept %", justify="right", width=10)
+    if active:
+        for item in active:
+            table.add_row(
+                str(item.get("file", "")),
+                str(item.get("state", "processing")),
+                f"{int(item.get('rows_seen', 0)):,}",
+                f"{int(item.get('accepted', 0)):,}",
+                f"{float(item.get('acceptance', 0.0)):.2f}%",
+            )
+    elif completed >= total:
+        table.add_row("All selected files complete", "complete", "—", "—", "—")
+    else:
+        table.add_row("Waiting for worker status…", "waiting", "0", "0", "0.00%")
+    return Panel(
+        table,
+        title=f"Stage 1 · {domain}",
+        subtitle=f"Completed files: {completed}/{total}",
+        border_style="cyan",
+    )
 
 
 def load_state(local_state: Path, repo_id: str, remote_state: str, revision: str, token: str) -> dict[str, Any]:
@@ -144,6 +205,12 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
         state = load_state(local_state, output["repo_id"], remote_state, revision, token)
     else:
         state = empty_state()
+    publish_status(
+        job,
+        int(state.get("rows_seen", 0)),
+        int(state.get("accepted", 0)),
+        "resuming" if job["resume"] else "starting",
+    )
     upload_pending(
         pending_path,
         state,
@@ -155,7 +222,8 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
         remote_prefix,
     )
     if state.get("finished"):
-        return state
+        publish_status(job, int(state.get("rows_seen", 0)), int(state.get("accepted", 0)), "already complete")
+        return {**state, "result_status": "already_complete"}
 
     stream = iter(stream_hf_parquet_file(source, source_file, token))
     try:
@@ -163,7 +231,8 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
     except StopIteration:
         state["finished"] = True
         save_state(state, local_state, api, output["repo_id"], remote_state, token)
-        return state
+        publish_status(job, 0, 0, "complete")
+        return {**state, "result_status": "processed"}
     available = sorted(first.keys()) if isinstance(first, dict) else []
     required = cfg.get("required_columns", [cfg.get("columns", {}).get("text", "text")])
     missing = [column for column in required if column not in available]
@@ -182,6 +251,8 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
     estimated_tokens = int(state.get("estimated_tokens", 0))
     limit_rows = job.get("limit_rows")
     started = time.perf_counter()
+    last_status = started
+    publish_status(job, rows_seen, accepted, "processing")
 
     rows = islice(chain([first], stream), rows_seen, None)
     for raw in rows:
@@ -192,12 +263,18 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
         ok, reason = accepts(row, cfg.get("filters", {}))
         if not ok:
             rejected[reason or "rejected"] += 1
-            continue
-        accepted += 1
-        estimated_tokens += int(row["estimated_tokens"] or 1)
-        part = writer.add(row)
+            part = None
+        else:
+            accepted += 1
+            estimated_tokens += int(row["estimated_tokens"] or 1)
+            part = writer.add(row)
+        now = time.perf_counter()
+        if rows_seen % 2048 == 0 or now - last_status >= 1.0:
+            publish_status(job, rows_seen, accepted, "processing")
+            last_status = now
         if part is None:
             continue
+        publish_status(job, rows_seen, accepted, "uploading")
         part_index = writer.index - 1
         state_after = {
             "source": source,
@@ -232,9 +309,11 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
             token,
             remote_prefix,
         )
+        publish_status(job, rows_seen, accepted, "processing")
 
     part = writer.flush()
     if part is not None:
+        publish_status(job, rows_seen, accepted, "uploading")
         part_index = writer.index - 1
         state_after = {
             "source": source,
@@ -286,7 +365,8 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
         }
     )
     save_state(state, local_state, api, output["repo_id"], remote_state, token)
-    return state
+    publish_status(job, rows_seen, accepted, "complete")
+    return {**state, "result_status": "processed"}
 
 
 def main() -> None:
@@ -321,24 +401,22 @@ def main() -> None:
         cfg["output"]["path_prefix"] = f"_smoke/{args.run_id}"
 
     output = cfg["output"]
+    console = Console()
     domain = str(output.get("domain", cfg["name"].replace("_", "-"))).strip("/")
     remote_prefix = output_prefix(str(output.get("path_prefix", "")), domain)
     max_inflight = max(1, min(args.max_inflight_files or args.workers, len(source_files)))
-    print(
-        {
-            "source": cfg["source"]["repo_id"],
-            "files_selected": len(source_files),
-            "first_files": [source_file for _, source_file in source_files[:5]],
-            "output_repo": output["repo_id"],
-            "output_folder": remote_prefix,
-            "shard_pattern": f"{remote_prefix}/{domain}_shard_00000.parquet",
-            "workers": args.workers,
-            "max_inflight_files": max_inflight,
-            "resume": not args.no_resume,
-            "run_id": output.get("run_id", "v1"),
-        }
-    )
     if args.dry_run:
+        plan = Table(box=None, show_header=False, padding=(0, 1))
+        plan.add_column("Field", style="cyan")
+        plan.add_column("Value")
+        plan.add_row("Source", cfg["source"]["repo_id"])
+        plan.add_row("Files selected", f"{len(source_files):,}")
+        plan.add_row("Output", f"{output['repo_id']}/{remote_prefix}")
+        plan.add_row("Shard pattern", f"{domain}_shard_00000.parquet")
+        plan.add_row("Workers", str(args.workers))
+        plan.add_row("Max in-flight", str(max_inflight))
+        plan.add_row("Resume", str(not args.no_resume))
+        console.print(Panel(plan, title=f"Stage 1 dry-run · {domain}", border_style="cyan"))
         return
 
     ensure_dataset_repo(api, output["repo_id"], token, private=bool(output.get("private", True)))
@@ -353,28 +431,62 @@ def main() -> None:
         }
         for source_index, source_file in source_files
     ]
-    results = []
-    pending = {}
-    job_iter = iter(jobs)
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        for _ in range(max_inflight):
-            try:
-                job = next(job_iter)
-            except StopIteration:
-                break
-            pending[executor.submit(process_file, job)] = job["source_file"]
-        while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                source_file = pending.pop(future)
-                result = future.result()
-                results.append(result)
-                print({"source_file": source_file, "status": "processed", **result})
-                try:
-                    job = next(job_iter)
-                except StopIteration:
-                    continue
-                pending[executor.submit(process_file, job)] = job["source_file"]
+    results: list[dict[str, Any]] = []
+    with Manager() as manager:
+        statuses = manager.dict()
+        for job in jobs:
+            job["status"] = statuses
+        pending = {}
+        job_iter = iter(jobs)
+        with Live(
+            status_panel(domain, statuses, 0, len(jobs)),
+            console=console,
+            refresh_per_second=2,
+        ) as live:
+            with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                for _ in range(max_inflight):
+                    try:
+                        job = next(job_iter)
+                    except StopIteration:
+                        break
+                    statuses[job["source_file"]] = {
+                        "file": job["source_file"], "rows_seen": 0, "accepted": 0,
+                        "acceptance": 0.0, "state": "queued",
+                    }
+                    pending[executor.submit(process_file, job)] = job["source_file"]
+                while pending:
+                    done, _ = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                    live.update(status_panel(domain, statuses, len(results), len(jobs)))
+                    for future in done:
+                        source_file = pending.pop(future)
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            console.print(f"[red]Failed[/red] {source_file}: {exc}")
+                            raise
+                        results.append(result)
+                        seen = int(result.get("rows_seen", 0))
+                        accepted = int(result.get("accepted", 0))
+                        acceptance = (100.0 * accepted / seen) if seen else 0.0
+                        if result.get("result_status") == "already_complete":
+                            console.print(f"[dim]Already complete[/dim] {source_file}")
+                        else:
+                            console.print(
+                                f"[green]Pushed[/green] {source_file} → {remote_prefix} "
+                                f"({int(result.get('next_part', 0))} shard(s), "
+                                f"{accepted:,}/{seen:,}, {acceptance:.2f}%)"
+                            )
+                        live.update(status_panel(domain, statuses, len(results), len(jobs)))
+                        try:
+                            job = next(job_iter)
+                        except StopIteration:
+                            continue
+                        statuses[job["source_file"]] = {
+                            "file": job["source_file"], "rows_seen": 0, "accepted": 0,
+                            "acceptance": 0.0, "state": "queued",
+                        }
+                        pending[executor.submit(process_file, job)] = job["source_file"]
+                live.update(status_panel(domain, statuses, len(results), len(jobs)))
     progress = {
         "stage": 1,
         "name": cfg["name"],
@@ -396,7 +508,11 @@ def main() -> None:
     )
     write_json(local_progress, progress)
     upload_file(api, output["repo_id"], local_progress, f"{remote_prefix}/progress.json", token)
-    print({**progress, "output_repo": output["repo_id"], "output_folder": remote_prefix})
+    acceptance = (100.0 * progress["accepted"] / progress["rows_seen"]) if progress["rows_seen"] else 0.0
+    console.print(
+        f"[bold green]Stage 1 complete[/bold green] · {domain} · "
+        f"accepted {progress['accepted']:,}/{progress['rows_seen']:,} ({acceptance:.2f}%)"
+    )
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import fnmatch
 from itertools import chain
@@ -13,8 +14,15 @@ from typing import Any, Iterable
 import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
+
 from datasets import load_dataset
 from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
+
+for logger_name in ("datasets", "huggingface_hub", "fsspec"):
+    logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 OUTPUT_SCHEMA = pa.schema(
