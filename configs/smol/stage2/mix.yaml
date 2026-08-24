@@ -10,16 +10,22 @@ sources:
     repo_id: "${FILTERED_REPO}"
     revision: main
     path_prefix: finepdfs-edu
+    filename_prefix: finepdfs-edu
+    progress_file: progress.json
     weight: 0.50
   - name: dclm
     repo_id: "${FILTERED_REPO}"
     revision: main
     path_prefix: dclm
+    filename_prefix: dclm
+    progress_file: progress.json
     weight: 0.30
   - name: fineweb_edu
     repo_id: "${FILTERED_REPO}"
     revision: main
     path_prefix: fineweb-edu
+    filename_prefix: fineweb-edu
+    progress_file: progress.json
     weight: 0.20
 
 output:
@@ -28,6 +34,8 @@ output:
   run_id: v1
   path_prefix: train
   filename_prefix: smol-v1
-  target_size_mb: 500
+  target_size_mb: 1024
+  staging_size_mb: 128
+  buffer_batch_rows: 4096
   max_documents: 1000000
   local_dir: work/smol_stage2

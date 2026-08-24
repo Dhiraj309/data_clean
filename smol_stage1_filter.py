@@ -369,7 +369,7 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
     return {**state, "result_status": "processed"}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--workers", type=int, default=max(1, min(4, os.cpu_count() or 1)))
@@ -379,7 +379,7 @@ def main() -> None:
     parser.add_argument("--run-id", default=None, help="Override config run_id, useful for smoke tests")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
     if int(cfg.get("stage", -1)) != 1:
@@ -442,6 +442,7 @@ def main() -> None:
             status_panel(domain, statuses, 0, len(jobs)),
             console=console,
             refresh_per_second=2,
+            auto_refresh=console.is_terminal or console.is_jupyter,
         ) as live:
             with ProcessPoolExecutor(max_workers=args.workers) as executor:
                 for _ in range(max_inflight):
@@ -513,6 +514,9 @@ def main() -> None:
         f"[bold green]Stage 1 complete[/bold green] · {domain} · "
         f"accepted {progress['accepted']:,}/{progress['rows_seen']:,} ({acceptance:.2f}%)"
     )
+
+
+from smol_stage1_buffered import main as main
 
 
 if __name__ == "__main__":

@@ -2,14 +2,16 @@
 
 This is the new lightweight path for Smol Data sources. It deliberately has only two data-processing stages:
 
-1. Stage 1 lists the source Parquet files, processes one source file per worker, applies row-level filters, and uploads all compressed Parquet shards to domain folders in one filtered-data repository.
+1. Stage 1 lists the source Parquet files, processes one source file per worker, applies row-level filters, and merges completed files in source order into one persistent domain buffer. Full approximately 1 GiB Parquet shards are uploaded to the filtered-data repository.
 2. Stage 2 streams those domain folders, samples them according to the configured weights, and uploads the final training Parquet shards.
 
 The pipeline does not download a whole source to local disk, does not run the old multi-pass corpus deduplication flow, and does not mix raw sources before filtering.
 
 ## Minimal live logging
 
-Stage 1 keeps one live box on screen showing each active source file, its status, rows seen, accepted rows, and acceptance percentage. After a source file finishes, it prints one concise `Pushed` line instead of the complete checkpoint dictionary. Stage 2 uses one live box for total rows, estimated tokens, current source, and actual versus target mixture percentages, plus one line per uploaded output shard. Hugging Face download and upload progress bars are disabled by default so notebook logs stay compact.
+In Jupyter, use `%run smol_stage1_filter.py ...` and `%run smol_stage2_mix.py ...` as demonstrated in `smol_data_pipeline.ipynb`. `%run` executes in the active kernel and lets Rich update one table in place. Running through `!python` creates a subprocess, so notebook frontends may append each table refresh instead.
+
+Stage 1 keeps one live box on screen showing each active source file, its status, rows seen, accepted rows, and acceptance percentage. It prints one concise `Buffered` line per completed source and one `Pushed` line only when a full shard is created. Stage 2 uses one live box for total rows, estimated tokens, current source, and actual versus target mixture percentages, plus one line per uploaded output shard. Hugging Face download and upload progress bars are disabled by default so notebook logs stay compact.
 
 ## Environment
 
@@ -85,7 +87,7 @@ LaughLM-Filtered-Smol/
 └── _checkpoints/stage1/v1/...
 ```
 
-The number identifies the original source file. If a large source file creates multiple 500 MB outputs, later parts use names such as `finepdfs-edu_shard_00000_001.parquet`. This deterministic naming prevents collisions when multiple source files run in parallel and ensures retries overwrite the same shard rather than duplicate rows. Each domain folder also receives `progress.json`. Partial buffers remain local until they form an uploadable Parquet shard.
+Workers write 128 MiB local staging pieces so filtering remains memory-safe. The parent process consumes completed sources in deterministic source order and rewrites `buffer.parquet` after each source. Whenever the compressed buffer crosses the configured 1024 MiB target, it becomes `domain_shard_00000.parquet`, `domain_shard_00001.parquet`, and so on; only the remainder stays in `buffer.parquet`. Both the remainder and `progress.json` are uploaded after each source, so another machine can resume from the last committed source. Because Parquet compression and row groups are indivisible, full shards are close to 1 GiB rather than byte-for-byte identical.
 
 The filters are in the individual YAML files. They currently require English, use a minimum language score of `0.95`, require at least 50 words and 200 characters, and apply source-specific quality fields when available. `missing_policy: ignore` means a source without a particular optional score is not rejected for that missing score; `missing_policy: reject` is used for DCLM's required score fields.
 
@@ -114,7 +116,7 @@ python -u smol_stage2_mix.py \
   --config configs/smol/stage2/mix.yaml
 ```
 
-Stage 2 also writes a local pending buffer and a checkpoint manifest to the output HF repository after each uploaded shard. If it stops, rerun the same command to continue the deterministic mixture from the last completed output shard. A restart may replay already-read Stage-1 rows to reconstruct the deterministic sampler state, but it will not create a second output shard sequence.
+Stage 2 uses the same rolling layout: approximately 1 GiB files named `smol-v1_shard_00000.parquet`, followed by one `train/buffer.parquet` remainder. It checkpoints after every 128 MiB staging commit and uploads the current remainder, so rerunning the same command resumes the deterministic mixture. A restart may replay already-read Stage-1 rows to reconstruct the sampler state, but it will not create a second output sequence.
 
 The initial weights are 50% FinePDFs-Edu, 30% DCLM, and 20% FineWeb-Edu. Change only the `weight` values in `configs/smol/stage2/mix.yaml` to try another mixture. The output is `HF_USER/laughlm-smol-v1-training/train/smol-v1_shard_00000.parquet` and subsequent compressed Parquet shards.
 

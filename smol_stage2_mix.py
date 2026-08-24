@@ -30,6 +30,7 @@ from smol_pipeline import (
     upload_file,
     write_json,
 )
+from smol_stage1_buffered import build_buffer_transaction, download_file_if_present
 
 
 def choose_source(rng: random.Random, sources: list[dict], exhausted: set[str]) -> dict:
@@ -90,13 +91,13 @@ def mix_status_panel(
 
 
 def load_state(local_state: Path, repo_id: str, remote_state: str, token: str, sources: list[dict]) -> dict[str, Any]:
-    if local_state.is_file():
-        return json.loads(local_state.read_text(encoding="utf-8"))
     remote = download_json_if_present(repo_id, remote_state, "main", token)
     if remote:
         local_state.parent.mkdir(parents=True, exist_ok=True)
         write_json(local_state, remote)
         return remote
+    if local_state.is_file():
+        return json.loads(local_state.read_text(encoding="utf-8"))
     return empty_state(sources)
 
 
@@ -147,7 +148,7 @@ def upload_pending(
     return remote_part
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--limit-rows", type=int, default=None)
@@ -155,7 +156,7 @@ def main() -> None:
     parser.add_argument("--run-id", default=None, help="Override config run_id, useful for smoke tests")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
     if int(cfg.get("stage", -1)) != 2:
@@ -199,7 +200,7 @@ def main() -> None:
     local_root = Path(output.get("local_dir", "work/smol_stage2")) / run_id
     local_root.mkdir(parents=True, exist_ok=True)
     local_state = local_root / "state.json"
-    pending_path = local_root / "pending.json"
+    local_buffer = local_root / "buffer.parquet"
     remote_state = f"_checkpoints/stage2/{run_id}.json"
     state = (
         load_state(local_state, output["repo_id"], remote_state, token, sources)
@@ -208,19 +209,11 @@ def main() -> None:
     )
     output_prefix_value = output.get("path_prefix", "data/" + run_id).rstrip("/")
     filename_prefix = str(output.get("filename_prefix", cfg.get("name", "training")))
-    recovered_part = upload_pending(
-        pending_path,
-        state,
-        local_state,
-        api,
-        output["repo_id"],
-        remote_state,
-        token,
-        output_prefix_value,
-        filename_prefix,
-    )
-    if recovered_part:
-        console.print(f"[green]Pushed[/green] {recovered_part} (recovered pending shard)")
+    buffer_ready = False
+    if not args.no_resume and int(state.get("rows", 0)):
+        buffer_ready = download_file_if_present(
+            output["repo_id"], f"{output_prefix_value}/buffer.parquet", "main", token, local_buffer
+        )
     if state.get("finished"):
         console.print("[dim]Stage 2 is already complete; nothing to process.[/dim]")
         return
@@ -233,6 +226,7 @@ def main() -> None:
         mix_status_panel(sources, counts, rows, estimated_tokens, target_tokens, "", "initializing"),
         console=console,
         refresh_per_second=2,
+        auto_refresh=console.is_terminal or console.is_jupyter,
     )
     live.start()
 
@@ -263,13 +257,40 @@ def main() -> None:
 
     writer = ShardWriter(
         local_root / "parts",
-        target_size_mb=int(output.get("target_size_mb", 256)),
-        max_documents=int(output.get("max_documents", 1_000_000)),
+        target_size_mb=int(output.get("staging_size_mb", 128)),
+        max_documents=int(output.get("staging_max_documents", 250_000)),
     )
-    writer.index = int(state.get("next_part", 0))
     started = time.perf_counter()
     last_status = started
     live.update(mix_status_panel(sources, counts, rows, estimated_tokens, target_tokens, "", "mixing"))
+
+    def commit_staging_part(part: Path) -> None:
+        nonlocal buffer_ready
+        current_buffer = local_buffer if buffer_ready else local_root / ".aggregate" / "no-current-buffer"
+        buffer_next, shards, next_shard = build_buffer_transaction(
+            current_buffer, [part], local_root / ".aggregate", filename_prefix,
+            int(state.get("next_part", 0)), int(output.get("target_size_mb", 1024)) * 1024 * 1024,
+            int(output.get("buffer_batch_rows", 4096)),
+        )
+        for shard_index, shard_path in shards:
+            remote_part = f"{output_prefix_value}/{filename_prefix}_shard_{shard_index:05d}.parquet"
+            upload_file(api, output["repo_id"], shard_path, remote_part, token)
+            console.print(f"[green]Pushed[/green] {remote_part} ({shard_path.stat().st_size / 1024**3:.3f} GiB)")
+        upload_file(api, output["repo_id"], buffer_next, f"{output_prefix_value}/buffer.parquet", token)
+        state_after = {
+            "stage": 2, "name": cfg.get("name", "smol_mix"), "run_id": run_id,
+            "rows": rows, "estimated_tokens": estimated_tokens, "rows_by_source": dict(counts),
+            "next_part": next_shard, "buffer_bytes": buffer_next.stat().st_size,
+            "finished": False, "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+        transaction_state = local_root / ".aggregate" / "state.json"
+        write_json(transaction_state, state_after)
+        upload_file(api, output["repo_id"], transaction_state, remote_state, token)
+        os.replace(buffer_next, local_buffer)
+        buffer_ready = True
+        write_json(local_state, state_after)
+        part.unlink(missing_ok=True)
+        state.update(state_after)
 
     while True:
         if args.limit_rows is not None and rows >= int(args.limit_rows):
@@ -304,47 +325,11 @@ def main() -> None:
             last_status = now
         if part is None:
             continue
-        part_index = writer.index - 1
-        state_after = {
-            "stage": 2,
-            "name": cfg.get("name", "smol_mix"),
-            "run_id": run_id,
-            "rows": rows,
-            "estimated_tokens": estimated_tokens,
-            "rows_by_source": counts,
-            "next_part": writer.index,
-            "finished": False,
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
-        }
-        write_json(pending_path, {"local_part": str(part), "part_index": part_index, "state_after": state_after})
-        remote_part = upload_pending(
-            pending_path, state, local_state, api, output["repo_id"], remote_state,
-            token, output_prefix_value, filename_prefix
-        )
-        if remote_part:
-            console.print(f"[green]Pushed[/green] {remote_part}")
+        commit_staging_part(part)
 
     part = writer.flush()
     if part is not None:
-        part_index = writer.index - 1
-        state_after = {
-            "stage": 2,
-            "name": cfg.get("name", "smol_mix"),
-            "run_id": run_id,
-            "rows": rows,
-            "estimated_tokens": estimated_tokens,
-            "rows_by_source": counts,
-            "next_part": writer.index,
-            "finished": False,
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
-        }
-        write_json(pending_path, {"local_part": str(part), "part_index": part_index, "state_after": state_after})
-        remote_part = upload_pending(
-            pending_path, state, local_state, api, output["repo_id"], remote_state,
-            token, output_prefix_value, filename_prefix
-        )
-        if remote_part:
-            console.print(f"[green]Pushed[/green] {remote_part}")
+        commit_staging_part(part)
 
     state.update({
         "stage": 2,
@@ -353,7 +338,8 @@ def main() -> None:
         "rows": rows,
         "estimated_tokens": estimated_tokens,
         "rows_by_source": counts,
-        "next_part": writer.index,
+        "next_part": int(state.get("next_part", 0)),
+        "buffer_bytes": local_buffer.stat().st_size if local_buffer.is_file() else 0,
         "finished": args.limit_rows is None and (target_tokens is None or estimated_tokens >= int(target_tokens)),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     })

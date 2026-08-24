@@ -123,9 +123,27 @@ def stream_parquet_prefix(api: HfApi, source: dict[str, Any], token: str):
     revision = source.get("revision", "main")
     prefix = source.get("path_prefix", "data/").rstrip("/") + "/"
     files = api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision=revision, token=token)
-    parquet_files = sorted(
-        p for p in files if p.startswith(prefix) and p.lower().endswith(".parquet")
-    )
+    if source.get("progress_file") and source.get("filename_prefix"):
+        progress_path = prefix + str(source["progress_file"]).lstrip("/")
+        progress = download_json_if_present(repo_id, progress_path, revision, token)
+        if progress is None:
+            raise RuntimeError(f"Missing Stage-1 progress manifest: {repo_id}:{progress_path}")
+        shard_count = int(progress.get("next_shard", 0))
+        filename_prefix = str(source["filename_prefix"])
+        parquet_files = [
+            f"{prefix}{filename_prefix}_shard_{index:05d}.parquet"
+            for index in range(shard_count)
+        ]
+        buffer_path = prefix + "buffer.parquet"
+        if buffer_path in files:
+            parquet_files.append(buffer_path)
+        missing = [path for path in parquet_files if path not in files]
+        if missing:
+            raise RuntimeError(f"Progress manifest references missing Parquet files: {missing[:5]}")
+    else:
+        parquet_files = sorted(
+            p for p in files if p.startswith(prefix) and p.lower().endswith(".parquet")
+        )
     if not parquet_files:
         raise RuntimeError(f"No Parquet files found in {repo_id}:{prefix}")
     urls = [hf_hub_url(repo_id, filename=p, repo_type="dataset", revision=revision) for p in parquet_files]

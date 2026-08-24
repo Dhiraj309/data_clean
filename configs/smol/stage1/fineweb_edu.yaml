@@ -35,6 +35,8 @@ output:
   private: true
   run_id: "v1"
   path_prefix: ""
-  target_size_mb: 500
+  target_size_mb: 1024
+  staging_size_mb: 128
+  buffer_batch_rows: 4096
   max_documents: 1000000
   local_dir: "work/smol_stage1"
