@@ -85,16 +85,16 @@ def as_float(value: Any) -> float | None:
 def as_int(value: Any) -> int | None:
     if value is None or value == "":
         return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def as_string(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def stream_hf_dataset(source: dict[str, Any], token: str):

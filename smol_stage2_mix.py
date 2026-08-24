@@ -82,6 +82,7 @@ def upload_pending(
     remote_state: str,
     token: str,
     output_prefix: str,
+    filename_prefix: str,
 ) -> None:
     if not pending_path.is_file():
         return
@@ -93,7 +94,10 @@ def upload_pending(
         return
     if not part.is_file():
         raise RuntimeError(f"Checkpoint references missing local buffer: {part}")
-    remote_part = f"{output_prefix}/part-{pending['part_index']:05d}.parquet"
+    remote_part = (
+        f"{output_prefix}/{filename_prefix}_shard_"
+        f"{pending['part_index']:05d}.parquet"
+    )
     upload_file(api, repo_id, part, remote_part, token)
     state.update(pending["state_after"])
     save_state(state, local_state, api, repo_id, remote_state, token, part=part)
@@ -123,7 +127,7 @@ def main() -> None:
         cfg = copy.deepcopy(cfg)
         cfg["output"] = dict(cfg["output"])
         cfg["output"]["run_id"] = args.run_id
-        cfg["output"]["path_prefix"] = f"data/{args.run_id}"
+        cfg["output"]["path_prefix"] = f"_smoke/{args.run_id}/train"
 
     token = hf_token()
     api = HfApi(token=token)
@@ -145,13 +149,14 @@ def main() -> None:
     local_root.mkdir(parents=True, exist_ok=True)
     local_state = local_root / "state.json"
     pending_path = local_root / "pending.json"
-    remote_state = f"manifests/{run_id}/stage2.json"
+    remote_state = f"_checkpoints/stage2/{run_id}.json"
     state = (
         load_state(local_state, output["repo_id"], remote_state, token, sources)
         if not args.no_resume
         else empty_state(sources)
     )
     output_prefix_value = output.get("path_prefix", "data/" + run_id).rstrip("/")
+    filename_prefix = str(output.get("filename_prefix", cfg.get("name", "training")))
     upload_pending(
         pending_path,
         state,
@@ -161,6 +166,7 @@ def main() -> None:
         remote_state,
         token,
         output_prefix_value,
+        filename_prefix,
     )
     if state.get("finished"):
         print(state)
@@ -234,7 +240,10 @@ def main() -> None:
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
         write_json(pending_path, {"local_part": str(part), "part_index": part_index, "state_after": state_after})
-        upload_pending(pending_path, state, local_state, api, output["repo_id"], remote_state, token, output_prefix_value)
+        upload_pending(
+            pending_path, state, local_state, api, output["repo_id"], remote_state,
+            token, output_prefix_value, filename_prefix
+        )
 
     part = writer.flush()
     if part is not None:
@@ -251,7 +260,10 @@ def main() -> None:
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
         write_json(pending_path, {"local_part": str(part), "part_index": part_index, "state_after": state_after})
-        upload_pending(pending_path, state, local_state, api, output["repo_id"], remote_state, token, output_prefix_value)
+        upload_pending(
+            pending_path, state, local_state, api, output["repo_id"], remote_state,
+            token, output_prefix_value, filename_prefix
+        )
 
     state.update({
         "stage": 2,

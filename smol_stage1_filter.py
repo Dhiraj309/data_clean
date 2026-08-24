@@ -34,13 +34,13 @@ def file_key(filename: str) -> str:
     return filename.replace("/", "__").replace("\\", "__")
 
 
-def output_prefix(path_prefix: str, source_file: str) -> str:
-    stem = source_file.rsplit(".", 1)[0]
-    return f"{path_prefix.rstrip('/')}/{stem}"
+def output_prefix(path_prefix: str, domain: str) -> str:
+    parts = [path_prefix.strip("/"), domain.strip("/")]
+    return "/".join(part for part in parts if part)
 
 
-def checkpoint_path(run_id: str, source_file: str) -> str:
-    return f"manifests/{run_id}/{source_file}.json"
+def checkpoint_path(run_id: str, domain: str, source_file: str) -> str:
+    return f"_checkpoints/stage1/{run_id}/{domain}/{file_key(source_file)}.json"
 
 
 def empty_state() -> dict[str, Any]:
@@ -101,10 +101,14 @@ def upload_pending(
         return
     if not part.is_file():
         raise RuntimeError(f"Checkpoint references missing local buffer: {part}")
-    remote_part = (
-        f"{remote_prefix}/filtered-{pending['source_stem']}-part-"
-        f"{pending['part_index']:05d}.parquet"
+    source_index = int(pending["source_index"])
+    part_index = int(pending["part_index"])
+    shard_suffix = (
+        f"{source_index:05d}"
+        if part_index == 0
+        else f"{source_index:05d}_{part_index:03d}"
     )
+    remote_part = f"{remote_prefix}/{pending['domain']}_shard_{shard_suffix}.parquet"
     upload_file(api, repo_id, part, remote_part, token)
     state.update(pending["state_after"])
     save_state(state, local_state, api, repo_id, remote_state, token, part=part)
@@ -117,12 +121,14 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
     output = cfg["output"]
     source_name = cfg["name"]
     source_file = job["source_file"]
+    source_index = int(job["source_index"])
     token = job["token"]
     api = HfApi(token=token)
     revision = output.get("revision", "main")
     run_id = str(output.get("run_id", "v1"))
-    path_prefix = output.get("path_prefix", "data/v1")
-    remote_prefix = output_prefix(path_prefix, source_file)
+    domain = str(output.get("domain", source_name.replace("_", "-"))).strip("/")
+    path_prefix = str(output.get("path_prefix", ""))
+    remote_prefix = output_prefix(path_prefix, domain)
     local_root = (
         Path(output.get("local_dir", "work/smol_stage1"))
         / source_name
@@ -133,7 +139,7 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
     local_state = local_root / "state.json"
     pending_path = local_root / "pending.json"
     local_root.mkdir(parents=True, exist_ok=True)
-    remote_state = checkpoint_path(run_id, source_file)
+    remote_state = checkpoint_path(run_id, domain, source_file)
     if job["resume"]:
         state = load_state(local_state, output["repo_id"], remote_state, revision, token)
     else:
@@ -211,7 +217,8 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
             {
                 "local_part": str(part),
                 "part_index": part_index,
-                "source_stem": Path(source_file).stem,
+                "source_index": source_index,
+                "domain": domain,
                 "state_after": state_after,
             },
         )
@@ -247,7 +254,8 @@ def process_file(job: dict[str, Any]) -> dict[str, Any]:
             {
                 "local_part": str(part),
                 "part_index": part_index,
-                "source_stem": Path(source_file).stem,
+                "source_index": source_index,
+                "domain": domain,
                 "state_after": state_after,
             },
         )
@@ -300,7 +308,7 @@ def main() -> None:
         raise ValueError("--workers must be positive")
     token = hf_token()
     api = HfApi(token=token)
-    source_files = list_hf_parquet_files(api, cfg["source"], token)
+    source_files = list(enumerate(list_hf_parquet_files(api, cfg["source"], token)))
     if args.limit_files is not None:
         source_files = source_files[: int(args.limit_files)]
     if not source_files:
@@ -310,16 +318,20 @@ def main() -> None:
         cfg = copy.deepcopy(cfg)
         cfg["output"] = dict(cfg["output"])
         cfg["output"]["run_id"] = args.run_id
-        cfg["output"]["path_prefix"] = f"data/{args.run_id}"
+        cfg["output"]["path_prefix"] = f"_smoke/{args.run_id}"
 
     output = cfg["output"]
+    domain = str(output.get("domain", cfg["name"].replace("_", "-"))).strip("/")
+    remote_prefix = output_prefix(str(output.get("path_prefix", "")), domain)
     max_inflight = max(1, min(args.max_inflight_files or args.workers, len(source_files)))
     print(
         {
             "source": cfg["source"]["repo_id"],
             "files_selected": len(source_files),
-            "first_files": source_files[:5],
+            "first_files": [source_file for _, source_file in source_files[:5]],
             "output_repo": output["repo_id"],
+            "output_folder": remote_prefix,
+            "shard_pattern": f"{remote_prefix}/{domain}_shard_00000.parquet",
             "workers": args.workers,
             "max_inflight_files": max_inflight,
             "resume": not args.no_resume,
@@ -334,11 +346,12 @@ def main() -> None:
         {
             "cfg": cfg,
             "source_file": source_file,
+            "source_index": source_index,
             "token": token,
             "limit_rows": args.limit_rows,
             "resume": not args.no_resume,
         }
-        for source_file in source_files
+        for source_index, source_file in source_files
     ]
     results = []
     pending = {}
@@ -362,7 +375,28 @@ def main() -> None:
                 except StopIteration:
                     continue
                 pending[executor.submit(process_file, job)] = job["source_file"]
-    print({"stage": 1, "files_processed": len(results), "output_repo": output["repo_id"]})
+    progress = {
+        "stage": 1,
+        "name": cfg["name"],
+        "domain": domain,
+        "run_id": output.get("run_id", "v1"),
+        "files_selected": len(source_files),
+        "files_processed": len(results),
+        "rows_seen": sum(int(result.get("rows_seen", 0)) for result in results),
+        "accepted": sum(int(result.get("accepted", 0)) for result in results),
+        "rejected": sum(int(result.get("rejected", 0)) for result in results),
+        "estimated_tokens": sum(int(result.get("estimated_tokens", 0)) for result in results),
+        "finished": all(bool(result.get("finished")) for result in results),
+    }
+    local_progress = (
+        Path(output.get("local_dir", "work/smol_stage1"))
+        / cfg["name"]
+        / str(output.get("run_id", "v1"))
+        / "progress.json"
+    )
+    write_json(local_progress, progress)
+    upload_file(api, output["repo_id"], local_progress, f"{remote_prefix}/progress.json", token)
+    print({**progress, "output_repo": output["repo_id"], "output_folder": remote_prefix})
 
 
 if __name__ == "__main__":

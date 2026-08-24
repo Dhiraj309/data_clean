@@ -28,10 +28,11 @@ filters:
   missing_policy: ignore
 
 output:
-  repo_id: "${HF_USER}/laughlm-smol-v1-stage1-finepdfs-edu"
+  repo_id: "${FILTERED_REPO}"
+  domain: "finepdfs-edu"
   private: true
   run_id: "v1"
-  path_prefix: "data/v1"
-  target_size_mb: 256
+  path_prefix: ""
+  target_size_mb: 500
   max_documents: 1000000
   local_dir: "work/smol_stage1"
