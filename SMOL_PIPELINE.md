@@ -75,7 +75,20 @@ python -u smol_stage1_filter.py --config configs/smol/stage1/fineweb_edu.yaml --
 python -u smol_stage1_filter.py --config configs/smol/stage1/finepdfs_edu.yaml --workers 12 --max-inflight-files 6
 ```
 
-To process only the first 20 source files, add `--limit-files 20`. If a command stops, rerun the same command without `--no-resume`; completed file shards and checkpoint manifests are reused.
+To process files in deterministic batches, use the zero-based `--start-file` offset together with `--limit-files`. For batches of 20 files:
+
+```bash
+# files 0..19
+python -u smol_stage1_filter.py --config configs/smol/stage1/dclm.yaml --start-file 0 --limit-files 20
+
+# files 20..39
+python -u smol_stage1_filter.py --config configs/smol/stage1/dclm.yaml --start-file 20 --limit-files 20
+
+# files 40..59
+python -u smol_stage1_filter.py --config configs/smol/stage1/dclm.yaml --start-file 40 --limit-files 20
+```
+
+The file list is sorted before slicing, and checkpoint indices use the full list, so the next batch continues with `N+1` rather than starting over. If a command stops, rerun the same command without `--no-resume`; completed files, the rolling buffer, and checkpoint manifests are reused.
 
 All Stage-1 datasets share `FILTERED_REPO` and use flat domain folders:
 

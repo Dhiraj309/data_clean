@@ -61,37 +61,44 @@ def empty_domain_state() -> dict[str, Any]:
     }
 
 
-def publish_status(job: dict[str, Any], rows_seen: int, accepted: int, state: str) -> None:
+def publish_status(
+    job: dict[str, Any], rows_seen: int, accepted: int, rejected: int, state: str,
+    detail: str = "",
+) -> None:
     shared = job.get("status")
     if shared is not None:
         shared[job["source_file"]] = {
-            "file": job["source_file"], "rows_seen": int(rows_seen), "accepted": int(accepted),
-            "acceptance": (100.0 * accepted / rows_seen) if rows_seen else 0.0, "state": state,
+            "file": job["source_file"], "source_index": int(job["source_index"]),
+            "rows_seen": int(rows_seen), "accepted": int(accepted),
+            "rejected": int(rejected),
+            "acceptance": (100.0 * accepted / rows_seen) if rows_seen else 0.0,
+            "state": state, "detail": detail,
         }
 
 
 def status_panel(domain: str, statuses: Any, completed: int, total: int) -> Panel:
-    active = [
-        item for item in dict(statuses).values()
-        if item.get("state") not in {"complete", "buffered"}
-    ]
+    active = sorted(
+        dict(statuses).values(), key=lambda item: int(item.get("source_index", 0)),
+    )
     table = Table(expand=True, box=None, padding=(0, 1))
     table.add_column("File", ratio=5, overflow="ellipsis")
     table.add_column("Status", width=12)
     table.add_column("Seen", justify="right", width=12)
     table.add_column("Accepted", justify="right", width=12)
+    table.add_column("Rejected", justify="right", width=12)
     table.add_column("Accept %", justify="right", width=10)
+    table.add_column("Detail", ratio=2, overflow="ellipsis", no_wrap=True)
     if active:
         for item in active:
             table.add_row(
                 str(item.get("file", "")), str(item.get("state", "processing")),
                 f"{int(item.get('rows_seen', 0)):,}", f"{int(item.get('accepted', 0)):,}",
+                f"{int(item.get('rejected', 0)):,}",
                 f"{float(item.get('acceptance', 0.0)):.2f}%",
+                str(item.get("detail", "")),
             )
-    elif completed >= total:
-        table.add_row("All selected files complete", "complete", "—", "—", "—")
     else:
-        table.add_row("Waiting for worker status…", "waiting", "0", "0", "0.00%")
+        table.add_row("No files selected", "idle", "0", "0", "0", "0.00%", "")
     return Panel(
         table, title=f"Stage 1 · {domain}", subtitle=f"Completed files: {completed}/{total}",
         border_style="cyan",
@@ -123,7 +130,10 @@ def filter_source_file(job: dict[str, Any]) -> dict[str, Any]:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         parts = [Path(value) for value in state.get("staging_parts", [])]
         if state.get("finished") and all(path.is_file() for path in parts):
-            publish_status(job, int(state.get("rows_seen", 0)), int(state.get("accepted", 0)), "complete")
+            publish_status(
+                job, int(state.get("rows_seen", 0)), int(state.get("accepted", 0)),
+                int(state.get("rejected", 0)), "complete", "resumed",
+            )
             return {**state, "result_status": "staged"}
         if any(not path.is_file() for path in parts):
             state = {}
@@ -140,7 +150,7 @@ def filter_source_file(job: dict[str, Any]) -> dict[str, Any]:
     writer.index = int(state.get("next_part", len(staging_parts)))
     started = time.perf_counter()
     last_status = started
-    publish_status(job, rows_seen, accepted, "processing")
+    publish_status(job, rows_seen, accepted, sum(rejected.values()), "loading", "opening source")
 
     stream = iter(stream_hf_parquet_file(source, source_file, job["token"]))
     try:
@@ -169,7 +179,7 @@ def filter_source_file(job: dict[str, Any]) -> dict[str, Any]:
                 rejected[reason or "rejected"] += 1
             now = time.perf_counter()
             if rows_seen % 2048 == 0 or now - last_status >= 1.0:
-                publish_status(job, rows_seen, accepted, "processing")
+                publish_status(job, rows_seen, accepted, sum(rejected.values()), "processing")
                 last_status = now
             if part is not None:
                 staging_parts.append(str(part))
@@ -193,7 +203,7 @@ def filter_source_file(job: dict[str, Any]) -> dict[str, Any]:
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
     save_source_state(state_path, result)
-    publish_status(job, rows_seen, accepted, "complete")
+    publish_status(job, rows_seen, accepted, sum(rejected.values()), "complete", "staged locally")
     return {**result, "result_status": "staged"}
 
 
@@ -295,6 +305,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--workers", type=int, default=max(1, min(4, os.cpu_count() or 1)))
     parser.add_argument("--max-inflight-files", type=int, default=None)
+    parser.add_argument(
+        "--start-file", type=int, default=0,
+        help="Zero-based offset into the sorted source file list",
+    )
     parser.add_argument("--limit-files", type=int, default=None)
     parser.add_argument("--limit-rows", type=int, default=None, help="Per-file smoke-test row limit")
     parser.add_argument("--run-id", default=None, help="Override config run_id, useful for smoke tests")
@@ -310,6 +324,10 @@ def main(argv: list[str] | None = None) -> None:
         raise RuntimeError(f"Stage-1 config {cfg.get('name', args.config)!r} is disabled: {reason}")
     if args.workers < 1:
         raise ValueError("--workers must be positive")
+    if args.start_file < 0:
+        raise ValueError("--start-file must be non-negative")
+    if args.limit_files is not None and args.limit_files < 1:
+        raise ValueError("--limit-files must be positive")
     if args.run_id:
         cfg = copy.deepcopy(cfg)
         cfg["output"] = dict(cfg["output"])
@@ -319,7 +337,11 @@ def main(argv: list[str] | None = None) -> None:
     token = hf_token()
     api = HfApi(token=token)
     all_source_files = list(enumerate(list_hf_parquet_files(api, cfg["source"], token)))
-    source_files = all_source_files[: int(args.limit_files)] if args.limit_files is not None else all_source_files
+    end_file = (
+        args.start_file + int(args.limit_files)
+        if args.limit_files is not None else len(all_source_files)
+    )
+    source_files = all_source_files[args.start_file:end_file]
     if not source_files:
         raise RuntimeError("No source files selected")
     output = cfg["output"]
@@ -334,6 +356,7 @@ def main(argv: list[str] | None = None) -> None:
         plan.add_column("Value")
         plan.add_row("Source", cfg["source"]["repo_id"])
         plan.add_row("Files selected", f"{len(source_files):,}")
+        plan.add_row("File range", f"{args.start_file}..{args.start_file + len(source_files) - 1}")
         plan.add_row("Output", f"{output['repo_id']}/{remote_prefix}")
         plan.add_row("Full shards", f"{domain}_shard_00000.parquet (~{target_size_mb / 1024:.2f} GiB)")
         plan.add_row("Remainder", f"{remote_prefix}/buffer.parquet")
@@ -378,6 +401,12 @@ def main(argv: list[str] | None = None) -> None:
         statuses = manager.dict()
         for job in jobs:
             job["status"] = statuses
+        for job in jobs:
+            statuses[job["source_file"]] = {
+                "file": job["source_file"], "source_index": int(job["source_index"]),
+                "rows_seen": 0, "accepted": 0, "rejected": 0, "acceptance": 0.0,
+                "state": "queued", "detail": "waiting for worker",
+            }
         pending: dict[Any, int] = {}
         job_iter = iter(jobs)
         with Live(
@@ -391,7 +420,11 @@ def main(argv: list[str] | None = None) -> None:
                         job = next(job_iter)
                     except StopIteration:
                         break
-                    statuses[job["source_file"]] = {"file": job["source_file"], "rows_seen": 0, "accepted": 0, "acceptance": 0.0, "state": "queued"}
+                    statuses[job["source_file"]] = {
+                        "file": job["source_file"], "source_index": int(job["source_index"]),
+                        "rows_seen": 0, "accepted": 0, "rejected": 0, "acceptance": 0.0,
+                        "state": "queued", "detail": "waiting for worker",
+                    }
                     pending[executor.submit(filter_source_file, job)] = int(job["source_index"])
                 while pending or ready:
                     if pending:
@@ -403,25 +436,42 @@ def main(argv: list[str] | None = None) -> None:
                                 job = next(job_iter)
                             except StopIteration:
                                 continue
-                            statuses[job["source_file"]] = {"file": job["source_file"], "rows_seen": 0, "accepted": 0, "acceptance": 0.0, "state": "queued"}
+                            statuses[job["source_file"]] = {
+                                "file": job["source_file"], "source_index": int(job["source_index"]),
+                                "rows_seen": 0, "accepted": 0, "rejected": 0, "acceptance": 0.0,
+                                "state": "queued", "detail": "waiting for worker",
+                            }
                             pending[executor.submit(filter_source_file, job)] = int(job["source_index"])
 
                     while next_order < len(ordered_indices) and ordered_indices[next_order] in ready:
                         index = ordered_indices[next_order]
                         result = ready.pop(index)
                         source_file = str(result["source_file"])
-                        statuses[source_file] = {**dict(statuses.get(source_file, {})), "state": "buffering"}
+                        statuses[source_file] = {
+                            **dict(statuses.get(source_file, {})),
+                            "state": "buffering", "detail": "merging into rolling buffer",
+                        }
                         current_buffer = local_buffer if completed_sources else local_root / ".aggregate" / "no-current-buffer"
                         buffer_next, shards, next_shard = build_buffer_transaction(
                             current_buffer, [Path(value) for value in result.get("staging_parts", [])],
                             local_root / ".aggregate", domain, int(state.get("next_shard", 0)),
                             target_size_mb * 1024 * 1024, int(output.get("buffer_batch_rows", 4096)),
                         )
+                        statuses[source_file] = {
+                            **dict(statuses.get(source_file, {})),
+                            "state": "uploading",
+                            "detail": f"uploading {len(shards)} full shard(s)",
+                        }
+                        live.update(status_panel(domain, statuses, len(completed_sources & set(selected_indices)), len(source_files)))
                         for shard_index, shard_path in shards:
                             remote_part = f"{remote_prefix}/{domain}_shard_{shard_index:05d}.parquet"
                             upload_file(api, output["repo_id"], shard_path, remote_part, token)
-                            console.print(f"[green]Pushed[/green] {remote_part} ({shard_path.stat().st_size / 1024**3:.3f} GiB)")
                         upload_file(api, output["repo_id"], buffer_next, f"{remote_prefix}/buffer.parquet", token)
+                        statuses[source_file] = {
+                            **dict(statuses.get(source_file, {})),
+                            "state": "uploaded", "detail": "buffer and shards uploaded",
+                        }
+                        live.update(status_panel(domain, statuses, len(completed_sources & set(selected_indices)), len(source_files)))
 
                         rejected_counts = Counter(state.get("rejected_by_reason", {}))
                         rejected_counts.update(result.get("rejected_by_reason", {}))
@@ -445,21 +495,18 @@ def main(argv: list[str] | None = None) -> None:
                         write_json(local_progress, state)
                         for value in result.get("staging_parts", []):
                             Path(value).unlink(missing_ok=True)
-                        statuses[source_file] = {**dict(statuses.get(source_file, {})), "state": "buffered"}
+                        statuses[source_file] = {
+                            **dict(statuses.get(source_file, {})),
+                            "state": "complete", "detail": "checkpoint saved",
+                        }
                         next_order += 1
-                        seen = int(result.get("rows_seen", 0))
-                        accepted = int(result.get("accepted", 0))
-                        pct = 100.0 * accepted / seen if seen else 0.0
-                        console.print(
-                            f"[cyan]Buffered[/cyan] {source_file} → {remote_prefix}/buffer.parquet "
-                            f"({accepted:,}/{seen:,}, {pct:.2f}%; buffer {local_buffer.stat().st_size / 1024**2:.1f} MiB)"
-                        )
                     live.update(status_panel(domain, statuses, len(completed_sources & set(selected_indices)), len(source_files)))
 
     acceptance = 100.0 * int(state["accepted"]) / int(state["rows_seen"]) if state.get("rows_seen") else 0.0
     console.print(
         f"[bold green]Stage 1 complete[/bold green] · {domain} · "
         f"accepted {int(state['accepted']):,}/{int(state['rows_seen']):,} ({acceptance:.2f}%) · "
+        f"rejected {int(state.get('rejected', 0)):,} · "
         f"full shards {int(state['next_shard']):,} · buffer {int(state.get('buffer_bytes', 0)) / 1024**2:.1f} MiB"
     )
 
