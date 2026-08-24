@@ -1,33 +1,38 @@
 stage: 1
-name: finepdfs_edu
+name: finemath
 
-# Verified fields: text, id, dump, url, date, file_path, language,
-# token_count, dataset. This release has no language_score field.
+# Verified config and fields on HuggingFaceTB/finemath.
 source:
-  repo_id: "HuggingFaceFW/finepdfs_edu_100BT-shuffled"
+  repo_id: "HuggingFaceTB/finemath"
+  config: "finemath-4plus"
   revision: "main"
   split: "train"
+  path_prefix: "finemath-4plus"
   file_pattern: "*.parquet"
 
 columns:
   text: text
-  id: id
   url: url
   language: language
+  language_score: language_score
   token_count: token_count
-  dataset: dataset
+  score: score
+  int_score: int_score
 
-required_columns: [text, id, token_count]
+required_columns: [text, language, language_score, token_count, int_score]
 
 filters:
-  min_token_count: 1024
+  languages: [en]
+  min_language_score: 0.90
+  min_int_score: 4
+  min_token_count: 256
   max_words: 150000
   max_chars: 750000
   missing_policy: reject
 
 output:
   repo_id: "${FILTERED_REPO}"
-  domain: "finepdfs-edu"
+  domain: "finemath-4plus"
   private: true
   run_id: "v1"
   path_prefix: ""

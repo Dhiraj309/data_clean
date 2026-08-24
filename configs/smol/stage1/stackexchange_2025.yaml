@@ -1,0 +1,35 @@
+stage: 1
+name: stackexchange_2025
+
+# Verified card schema. ThreadText is the rendered question-and-answer thread.
+source:
+  repo_id: "HuggingFaceTB/stackexchange_2025_md"
+  revision: "main"
+  split: "train"
+  file_pattern: "*.parquet"
+
+columns:
+  text: ThreadText
+  id: Id
+  score: Score
+
+required_columns: [ThreadText, Id, Score]
+
+filters:
+  min_words: 100
+  max_words: 100000
+  min_chars: 400
+  max_chars: 500000
+  missing_policy: reject
+
+output:
+  repo_id: "${FILTERED_REPO}"
+  domain: "stackexchange-2025"
+  private: true
+  run_id: "v1"
+  path_prefix: ""
+  target_size_mb: 1024
+  staging_size_mb: 128
+  buffer_batch_rows: 4096
+  max_documents: 1000000
+  local_dir: "work/smol_stage1"

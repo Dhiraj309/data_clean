@@ -2,7 +2,7 @@ stage: 1
 name: dclm
 
 source:
-  repo_id: "mlfoundations/dclm-baseline-1.0-parquet"
+  repo_id: "HuggingFaceFW/dclm_100BT-shuffled"
   revision: "main"
   split: "train"
 
@@ -20,7 +20,8 @@ required_columns: [text, id, language, language_score, fasttext_score]
 filters:
   languages: [en]
   min_language_score: 0.95
-  min_fasttext_score: 0.20
+  # Official DCLM-Baseline OH-2.5 + ELI5 fastText cutoff.
+  min_fasttext_score: 0.018112
   min_words: 50
   max_words: 100000
   min_chars: 200

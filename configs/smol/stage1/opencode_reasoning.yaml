@@ -1,0 +1,39 @@
+stage: 1
+name: opencode_reasoning
+enabled: false
+disabled_reason: >-
+  OpenCodeReasoning is prompt/solution supervision data. Keep it for SFT or a
+  dedicated later reasoning stage so pretraining filtering preserves its structure.
+
+# Verified configs/splits: split_0 and split_1.
+# Fields: id, input, output, source, license, dataset, split, difficulty, solution.
+source:
+  repo_id: "nvidia/OpenCodeReasoning"
+  revision: "main"
+  configs: [split_0, split_1]
+  splits: [split_0, split_1]
+
+columns:
+  id: id
+  prompt: input
+  text: output
+  reference_solution: solution
+  dataset: dataset
+
+required_columns: [id, input, output, source, dataset, difficulty, solution]
+
+selection:
+  correctness_field: solution
+  preserve_fields: [input, output, solution, source, difficulty, license]
+
+output:
+  repo_id: "${FILTERED_REPO}"
+  domain: "opencode-reasoning"
+  private: true
+  run_id: "v1"
+  path_prefix: ""
+  target_size_mb: 1024
+  staging_size_mb: 128
+  buffer_batch_rows: 4096
+  max_documents: 1000000
+  local_dir: "work/smol_stage1"

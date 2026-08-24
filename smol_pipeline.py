@@ -283,6 +283,7 @@ def accepts(row: dict[str, Any], filters: dict[str, Any]) -> tuple[bool, str | N
         ("score", "min_score"),
         ("int_score", "min_int_score"),
         ("token_count", "min_token_count"),
+        ("estimated_tokens", "min_estimated_tokens"),
     )
     missing_policy = filters.get("missing_policy", "ignore")
     for field, threshold_key in numeric:

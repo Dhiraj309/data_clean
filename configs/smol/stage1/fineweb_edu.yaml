@@ -2,7 +2,7 @@ stage: 1
 name: fineweb_edu
 
 source:
-  repo_id: "HuggingFaceFW/fineweb-edu"
+  repo_id: "HuggingFaceFW/fineweb_edu_100BT-shuffled"
   revision: "main"
   split: "train"
 
@@ -17,17 +17,16 @@ columns:
   int_score: int_score
   dataset: dataset
 
-required_columns: [text, id, language]
+required_columns: [text, id, language, language_score, token_count, int_score]
 
 filters:
   languages: [en]
   min_language_score: 0.95
   min_int_score: 3
-  min_words: 50
+  min_token_count: 256
   max_words: 100000
-  min_chars: 200
   max_chars: 500000
-  missing_policy: ignore
+  missing_policy: reject
 
 output:
   repo_id: "${FILTERED_REPO}"

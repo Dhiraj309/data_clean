@@ -1,0 +1,40 @@
+stage: 1
+name: openmath_reasoning
+enabled: false
+disabled_reason: >-
+  OpenMathReasoning selection depends on answer correctness and
+  pass_rate_72b_tir. Keep it for the later reasoning/SFT stage.
+
+# Verified splits: cot, tir, genselect, additional_problems.
+# Fields: expected_answer, problem_type, problem_source, generation_model,
+# pass_rate_72b_tir, problem, generated_solution, inference_mode, used_in_kaggle.
+source:
+  repo_id: "nvidia/OpenMathReasoning"
+  revision: "main"
+  splits: [cot, tir, genselect, additional_problems]
+
+columns:
+  prompt: problem
+  text: generated_solution
+  answer: expected_answer
+  score: pass_rate_72b_tir
+  dataset: problem_source
+
+required_columns: [problem, generated_solution, expected_answer, pass_rate_72b_tir]
+
+selection:
+  correctness_field: expected_answer
+  pass_rate_field: pass_rate_72b_tir
+  note: "pass_rate_72b_tir may contain numeric strings or 'n/a'."
+
+output:
+  repo_id: "${FILTERED_REPO}"
+  domain: "openmath-reasoning"
+  private: true
+  run_id: "v1"
+  path_prefix: ""
+  target_size_mb: 1024
+  staging_size_mb: 128
+  buffer_batch_rows: 4096
+  max_documents: 1000000
+  local_dir: "work/smol_stage1"

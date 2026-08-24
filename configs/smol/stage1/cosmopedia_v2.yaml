@@ -1,33 +1,31 @@
 stage: 1
-name: finepdfs_edu
+name: cosmopedia_v2
 
-# Verified fields: text, id, dump, url, date, file_path, language,
-# token_count, dataset. This release has no language_score field.
+# Verified fields: prompt, text, token_length, audience, format, seed_data.
 source:
-  repo_id: "HuggingFaceFW/finepdfs_edu_100BT-shuffled"
+  repo_id: "HuggingFaceTB/smollm-corpus"
+  config: "cosmopedia-v2"
   revision: "main"
   split: "train"
+  path_prefix: "cosmopedia-v2"
   file_pattern: "*.parquet"
 
 columns:
   text: text
-  id: id
-  url: url
-  language: language
-  token_count: token_count
-  dataset: dataset
+  token_count: token_length
+  dataset: seed_data
 
-required_columns: [text, id, token_count]
+required_columns: [text, token_length]
 
 filters:
-  min_token_count: 1024
+  min_token_count: 256
   max_words: 150000
   max_chars: 750000
   missing_policy: reject
 
 output:
   repo_id: "${FILTERED_REPO}"
-  domain: "finepdfs-edu"
+  domain: "cosmopedia-v2"
   private: true
   run_id: "v1"
   path_prefix: ""
