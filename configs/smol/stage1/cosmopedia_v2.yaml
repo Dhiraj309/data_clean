@@ -15,12 +15,19 @@ columns:
   token_count: token_length
   dataset: seed_data
 
-required_columns: [text, token_length]
+required_columns:
+  - text
+  - token_length
 
 filters:
-  min_token_count: 256
-  max_words: 150000
-  max_chars: 750000
+  # Keep substantive educational samples while preserving topic diversity.
+  min_token_count: 512
+
+  # Primarily corruption/outlier guards; not intended to aggressively
+  # remove legitimate long-form Cosmopedia content.
+  max_words: 25000
+  max_chars: 150000
+
   missing_policy: reject
 
 output:
@@ -29,8 +36,10 @@ output:
   private: true
   run_id: "v1"
   path_prefix: ""
+
   target_size_mb: 1024
   staging_size_mb: 128
   buffer_batch_rows: 4096
+
   max_documents: 1000000
   local_dir: "work/smol_stage1"

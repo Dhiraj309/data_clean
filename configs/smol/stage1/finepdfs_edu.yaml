@@ -17,12 +17,24 @@ columns:
   token_count: token_count
   dataset: dataset
 
-required_columns: [text, id, token_count]
+required_columns:
+  - text
+  - id
+  - language
+  - token_count
 
 filters:
+  # English-only model.
+  languages: [en]
+
+  # Keep substantial long-form educational / academic PDF content.
   min_token_count: 1024
-  max_words: 150000
-  max_chars: 750000
+
+  # Generous upper bounds to retain valid papers, manuals,
+  # reports, and textbook-style documents while removing outliers.
+  max_words: 100000
+  max_chars: 500000
+
   missing_policy: reject
 
 output:
@@ -31,8 +43,10 @@ output:
   private: true
   run_id: "v1"
   path_prefix: ""
+
   target_size_mb: 1024
   staging_size_mb: 128
   buffer_batch_rows: 4096
+
   max_documents: 1000000
   local_dir: "work/smol_stage1"

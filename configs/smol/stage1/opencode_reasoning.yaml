@@ -1,17 +1,33 @@
 stage: 1
 name: opencode_reasoning
-enabled: false
-disabled_reason: >-
-  OpenCodeReasoning is prompt/solution supervision data. Keep it for SFT or a
-  dedicated later reasoning stage so pretraining filtering preserves its structure.
 
-# Verified configs/splits: split_0 and split_1.
-# Fields: id, input, output, source, license, dataset, split, difficulty, solution.
+# Stage 1 exclusion:
+# OpenCodeReasoning is synthetic prompt/response reasoning data explicitly
+# designed for supervised fine-tuning, not base pretraining.
+enabled: false
+
+disabled_reason: >-
+  OpenCodeReasoning contains synthetic competitive-programming supervision
+  generated for supervised fine-tuning. Preserve its prompt, reasoning output,
+  reference solution, source, difficulty, and license metadata for a dedicated
+  later code-reasoning/SFT stage instead of flattening it into Stage 1
+  pretraining text.
+
+# Verified configs: split_0 and split_1.
+# Fields: id, input, output, solution, dataset, license, split,
+# source, difficulty, index.
+#
+# input is populated directly for split_0.
+# Some split_1 questions need to be reconstructed from source metadata.
 source:
   repo_id: "nvidia/OpenCodeReasoning"
   revision: "main"
-  configs: [split_0, split_1]
-  splits: [split_0, split_1]
+  configs:
+    - split_0
+    - split_1
+  splits:
+    - split_0
+    - split_1
 
 columns:
   id: id
@@ -20,11 +36,25 @@ columns:
   reference_solution: solution
   dataset: dataset
 
-required_columns: [id, input, output, source, dataset, difficulty, solution]
+required_columns:
+  - id
+  - output
+  - solution
+  - source
+  - dataset
+  - difficulty
 
 selection:
-  correctness_field: solution
-  preserve_fields: [input, output, solution, source, difficulty, license]
+  preserve_fields:
+    - input
+    - output
+    - solution
+    - source
+    - dataset
+    - split
+    - difficulty
+    - index
+    - license
 
 output:
   repo_id: "${FILTERED_REPO}"
@@ -32,8 +62,10 @@ output:
   private: true
   run_id: "v1"
   path_prefix: ""
+
   target_size_mb: 1024
   staging_size_mb: 128
   buffer_batch_rows: 4096
+
   max_documents: 1000000
   local_dir: "work/smol_stage1"

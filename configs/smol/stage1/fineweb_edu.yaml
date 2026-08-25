@@ -17,15 +17,33 @@ columns:
   int_score: int_score
   dataset: dataset
 
-required_columns: [text, id, language, language_score, token_count, int_score]
+required_columns:
+  - text
+  - id
+  - language
+  - language_score
+  - token_count
+  - int_score
 
 filters:
+  # English-only model.
   languages: [en]
-  min_language_score: 0.95
+
+  # Stricter English-confidence filter while preserving
+  # technical and educational content.
+  min_language_score: 0.93
+
+  # FineWeb-Edu educational-quality threshold.
   min_int_score: 3
-  min_token_count: 256
-  max_words: 100000
-  max_chars: 500000
+
+  # Remove very short web documents while preserving
+  # useful medium-length educational pages.
+  min_token_count: 512
+
+  # Outlier / corruption guards.
+  max_words: 50000
+  max_chars: 250000
+
   missing_policy: reject
 
 output:
@@ -34,8 +52,10 @@ output:
   private: true
   run_id: "v1"
   path_prefix: ""
+
   target_size_mb: 1024
   staging_size_mb: 128
   buffer_batch_rows: 4096
+
   max_documents: 1000000
   local_dir: "work/smol_stage1"

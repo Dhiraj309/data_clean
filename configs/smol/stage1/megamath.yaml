@@ -1,7 +1,9 @@
 stage: 1
 name: megamath_web_pro
 
-# Verified raw Web-Pro shards contain one field: text. The source is already EN.
+# Verified raw Web-Pro shards contain one field: text.
+# The source is already English and has undergone upstream
+# math-oriented extraction, quality filtering, and deduplication.
 source:
   repo_id: "IFM/MegaMath"
   revision: "main"
@@ -12,13 +14,22 @@ source:
 columns:
   text: text
 
-required_columns: [text]
+required_columns:
+  - text
 
 filters:
-  # Web-Pro has no token_count; Stage 1 estimates tokens as 1.3 * words.
+  # No source token_count is available.
+  # Stage 1 estimates tokens as ~1.3 * words.
+  #
+  # Keep this relatively permissive because mathematical notation,
+  # LaTeX and equations can yield substantially more real tokens
+  # than a prose-based word estimate suggests.
   min_estimated_tokens: 256
-  max_words: 150000
-  max_chars: 750000
+
+  # Outlier / malformed-web-document guards.
+  max_words: 50000
+  max_chars: 250000
+
   missing_policy: reject
 
 output:
@@ -27,8 +38,10 @@ output:
   private: true
   run_id: "v1"
   path_prefix: ""
+
   target_size_mb: 1024
   staging_size_mb: 128
   buffer_batch_rows: 4096
+
   max_documents: 1000000
   local_dir: "work/smol_stage1"

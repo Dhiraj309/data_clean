@@ -1,0 +1,83 @@
+stage: 1
+name: opencode_reasoning_2
+
+# Stage 1 exclusion:
+# OpenCodeReasoning-2 is structured synthetic supervision explicitly designed
+# for SFT of code generation/completion and code critique.
+enabled: false
+
+disabled_reason: >-
+  OpenCodeReasoning-2 contains synthetic code-generation and code-critique
+  supervision designed for supervised fine-tuning. Preserve R1 generations,
+  QwQ critiques, executable solutions, judgements, pass rates, difficulty,
+  provenance, and language split information for a dedicated later
+  code-reasoning/SFT stage rather than using it as Stage 1 base-pretraining
+  text.
+
+# Current dataset structure:
+# Config: train
+# Splits: python, cpp
+#
+# Fields:
+# question, r1_generation, qwq_critique, solution, judgement,
+# pass_rate, source, license, dataset, split, difficulty,
+# index, id, question_id.
+source:
+  repo_id: "nvidia/OpenCodeReasoning-2"
+  revision: "main"
+  config: "train"
+  splits:
+    - python
+    - cpp
+
+columns:
+  id: id
+  question_id: question_id
+  prompt: question
+  text: r1_generation
+  critique: qwq_critique
+  reference_solution: solution
+  judgement: judgement
+  pass_rate: pass_rate
+  dataset: dataset
+
+required_columns:
+  - id
+  - question_id
+  - r1_generation
+  - qwq_critique
+  - solution
+  - judgement
+  - source
+  - dataset
+  - difficulty
+
+selection:
+  preserve_fields:
+    - question
+    - r1_generation
+    - qwq_critique
+    - solution
+    - judgement
+    - pass_rate
+    - source
+    - dataset
+    - split
+    - difficulty
+    - index
+    - license
+    - question_id
+
+output:
+  repo_id: "${FILTERED_REPO}"
+  domain: "opencode-reasoning-2"
+  private: true
+  run_id: "v1"
+  path_prefix: ""
+
+  target_size_mb: 1024
+  staging_size_mb: 128
+  buffer_batch_rows: 4096
+
+  max_documents: 3000000
+  local_dir: "work/smol_stage1"

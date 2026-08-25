@@ -15,17 +15,31 @@ columns:
   fasttext_score: fasttext_score
   dataset: dataset
 
-required_columns: [text, id, language, language_score, fasttext_score]
+required_columns:
+  - text
+  - id
+  - language
+  - language_score
+  - fasttext_score
 
 filters:
+  # English-only model.
   languages: [en]
+
+  # Keep only high-confidence English documents.
   min_language_score: 0.95
-  # Official DCLM-Baseline OH-2.5 + ELI5 fastText cutoff.
+
+  # Official DCLM-Baseline OH-2.5 + ELI5 fastText quality cutoff.
   min_fasttext_score: 0.018112
-  min_words: 50
-  max_words: 100000
-  min_chars: 200
-  max_chars: 500000
+
+  # Remove very short / low-information web documents.
+  min_words: 100
+  min_chars: 400
+
+  # Outlier / corruption guards.
+  max_words: 50000
+  max_chars: 250000
+
   missing_policy: reject
 
 output:
@@ -34,8 +48,10 @@ output:
   private: true
   run_id: "v1"
   path_prefix: ""
+
   target_size_mb: 1024
   staging_size_mb: 128
   buffer_batch_rows: 4096
+
   max_documents: 1000000
   local_dir: "work/smol_stage1"

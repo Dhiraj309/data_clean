@@ -1,26 +1,92 @@
 stage: 1
 name: stack_edu
-enabled: false
-disabled_reason: >-
-  HuggingFaceTB/stack-edu contains repository metadata and quality scores but no
-  source-code/text column. Join blob_id against the original Stack source first,
-  or use a text-bearing code corpus.
 
-# Verified fields: blob_id, language, repo_name, path, src_encoding,
+enabled: false
+
+disabled_reason: >-
+  HuggingFaceTB/stack-edu contains educational-code quality scores and source
+  metadata, but does not contain the actual source-code text. Use blob_id to
+  recover the corresponding source code from the underlying Stack/StarCoder2
+  source, then run normal Stage 1 text/code filtering.
+
+# Verified fields:
+# blob_id, language, repo_name, path, src_encoding,
 # length_bytes, score, int_score, detected_licenses, license_type.
 source:
   repo_id: "HuggingFaceTB/stack-edu"
   revision: "main"
   split: "train"
-  available_configs: [C, CSharp, Cpp, Go, Java, JavaScript, Markdown, PHP, Python, Ruby, Rust, SQL, Shell, Swift, TypeScript]
 
-required_columns: [blob_id, language, repo_name, path, score, int_score]
+  available_configs:
+    - C
+    - CSharp
+    - Cpp
+    - Go
+    - Java
+    - JavaScript
+    - Markdown
+    - PHP
+    - Python
+    - Ruby
+    - Rust
+    - SQL
+    - Shell
+    - Swift
+    - TypeScript
+
+required_columns:
+  - blob_id
+  - language
+  - repo_name
+  - path
+  - length_bytes
+  - score
+  - int_score
+  - detected_licenses
+  - license_type
 
 special_handling:
+  # Recover source code using the Stack/StarCoder2 blob identifier.
   join_key: blob_id
   text_field_after_join: text
-  code_length_field: length_bytes
-  quality_fields: [score, int_score]
+
+  # Cheap metadata-side file-size guards before source recovery.
+  min_length_bytes: 200
+  max_length_bytes: 1000000
+
+  # Educational-code quality metadata.
+  quality_fields:
+    - score
+    - int_score
+
+  # Stack-Edu quality thresholds.
+  quality_thresholds:
+    default_min_int_score: 3
+
+    # Java was released with a lower preferred threshold.
+    per_language:
+      Java: 2
+
+  # Preserve provenance, encoding, quality, and license information
+  # for the later text-bearing filtering stage.
+  preserve_fields:
+    - blob_id
+    - language
+    - repo_name
+    - path
+    - src_encoding
+    - length_bytes
+    - score
+    - int_score
+    - detected_licenses
+    - license_type
+
+  note: >-
+    The language field denotes programming language, not natural-language
+    detection. Do not apply an English-language filter here. Do not add an
+    arbitrary continuous score cutoff on top of int_score. After recovering
+    the actual source code, apply tokenizer-length, generated/minified-code,
+    deduplication, encoding, and license-policy filtering.
 
 output:
   repo_id: "${FILTERED_REPO}"
@@ -28,8 +94,10 @@ output:
   private: true
   run_id: "v1"
   path_prefix: ""
+
   target_size_mb: 1024
   staging_size_mb: 128
   buffer_batch_rows: 4096
+
   max_documents: 1000000
   local_dir: "work/smol_stage1"

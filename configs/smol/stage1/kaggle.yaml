@@ -1,7 +1,7 @@
 stage: 1
 name: kaggle
 
-# Verified kaggle fields: file_id, text.
+# Verified fields: file_id, text.
 source:
   repo_id: "HuggingFaceTB/issues-kaggle-notebooks"
   config: "kaggle"
@@ -14,13 +14,20 @@ columns:
   text: text
   id: file_id
 
-required_columns: [text, file_id]
+required_columns:
+  - text
+  - file_id
 
 filters:
-  min_words: 100
+  # Require a substantive notebook while allowing code-heavy documents.
+  min_words: 50
+  min_chars: 500
+
+  # Notebooks can legitimately be considerably longer than GitHub issues.
+  # These primarily remove pathological notebook/output dumps.
   max_words: 100000
-  min_chars: 400
   max_chars: 500000
+
   missing_policy: reject
 
 output:
@@ -29,8 +36,10 @@ output:
   private: true
   run_id: "v1"
   path_prefix: ""
+
   target_size_mb: 1024
   staging_size_mb: 128
   buffer_batch_rows: 4096
+
   max_documents: 1000000
   local_dir: "work/smol_stage1"

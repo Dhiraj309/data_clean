@@ -1,31 +1,80 @@
 stage: 1
 name: openmath_reasoning
-enabled: false
-disabled_reason: >-
-  OpenMathReasoning selection depends on answer correctness and
-  pass_rate_72b_tir. Keep it for the later reasoning/SFT stage.
 
-# Verified splits: cot, tir, genselect, additional_problems.
-# Fields: expected_answer, problem_type, problem_source, generation_model,
-# pass_rate_72b_tir, problem, generated_solution, inference_mode, used_in_kaggle.
+# OpenMathReasoning is structured synthetic math-reasoning supervision.
+# Keep it out of Stage 1 base pretraining and preserve its structure for
+# a dedicated reasoning / SFT stage.
+enabled: false
+
+disabled_reason: >-
+  OpenMathReasoning contains structured mathematical problems with synthetic
+  CoT, tool-integrated reasoning, and GenSelect supervision. Keep these samples
+  for a dedicated later reasoning/SFT stage rather than flattening them into
+  Stage 1 base-pretraining text. The additional_problems split contains
+  prompt-only data and should be handled separately.
+
+# Verified config: default
+#
+# Reasoning splits:
+#   cot
+#   tir
+#   genselect
+#
+# additional_problems contains problems without generated solutions and is
+# intentionally excluded from this supervision config.
+#
+# Fields:
+# expected_answer, problem_type, problem_source, generation_model,
+# pass_rate_72b_tir, problem, generated_solution,
+# inference_mode, used_in_kaggle
 source:
   repo_id: "nvidia/OpenMathReasoning"
   revision: "main"
-  splits: [cot, tir, genselect, additional_problems]
+  config: "default"
+  splits:
+    - cot
+    - tir
+    - genselect
 
 columns:
   prompt: problem
   text: generated_solution
-  answer: expected_answer
+  reference_answer: expected_answer
   score: pass_rate_72b_tir
   dataset: problem_source
 
-required_columns: [problem, generated_solution, expected_answer, pass_rate_72b_tir]
+required_columns:
+  - problem
+  - generated_solution
+  - expected_answer
+  - problem_type
+  - problem_source
+  - inference_mode
 
 selection:
-  correctness_field: expected_answer
-  pass_rate_field: pass_rate_72b_tir
-  note: "pass_rate_72b_tir may contain numeric strings or 'n/a'."
+  # expected_answer is a reference answer, not a correctness flag.
+  reference_answer_field: expected_answer
+
+  # Problem-level difficulty / solvability proxy.
+  difficulty_proxy_field: pass_rate_72b_tir
+
+  preserve_fields:
+    - problem
+    - generated_solution
+    - expected_answer
+    - problem_type
+    - problem_source
+    - generation_model
+    - pass_rate_72b_tir
+    - inference_mode
+    - used_in_kaggle
+
+  note: >-
+    pass_rate_72b_tir may contain numeric strings or "n/a". Treat it as a
+    nullable problem-level difficulty/solvability signal rather than as
+    correctness of the current generated_solution. Individual solution
+    correctness should be evaluated separately against expected_answer where
+    reliable.
 
 output:
   repo_id: "${FILTERED_REPO}"
@@ -33,8 +82,10 @@ output:
   private: true
   run_id: "v1"
   path_prefix: ""
+
   target_size_mb: 1024
   staging_size_mb: 128
   buffer_batch_rows: 4096
-  max_documents: 1000000
+
+  max_documents: 6000000
   local_dir: "work/smol_stage1"

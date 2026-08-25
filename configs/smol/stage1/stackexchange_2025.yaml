@@ -1,7 +1,7 @@
 stage: 1
 name: stackexchange_2025
 
-# Verified card schema. ThreadText is the rendered question-and-answer thread.
+# Stack Exchange rendered Q&A threads.
 source:
   repo_id: "HuggingFaceTB/stackexchange_2025_md"
   revision: "main"
@@ -12,14 +12,32 @@ columns:
   text: ThreadText
   id: Id
   score: Score
+  answer_count: AnswerCount
+  accepted_answer_id: AcceptedAnswerId
 
-required_columns: [ThreadText, Id, Score]
+required_columns:
+  - ThreadText
+  - Id
+  - Score
+  - AnswerCount
 
 filters:
-  min_words: 100
-  max_words: 100000
-  min_chars: 400
-  max_chars: 500000
+  # Light community-quality filter.
+  # Score is the Stack Exchange vote score, not an ML quality score.
+  min_score: 1
+
+  # Prefer actual Q&A threads over unanswered questions.
+  min_answer_count: 1
+
+  # Preserve concise but useful technical / educational discussions.
+  min_words: 75
+  min_chars: 300
+
+  # Outlier / corruption guards for extremely large rendered threads.
+  max_words: 50000
+  max_chars: 250000
+
+  # Do not require an accepted answer; good answers may exist without one.
   missing_policy: reject
 
 output:
@@ -28,8 +46,10 @@ output:
   private: true
   run_id: "v1"
   path_prefix: ""
+
   target_size_mb: 1024
   staging_size_mb: 128
   buffer_batch_rows: 4096
+
   max_documents: 1000000
   local_dir: "work/smol_stage1"
