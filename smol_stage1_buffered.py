@@ -105,12 +105,17 @@ def status_panel(domain: str, statuses: Any, completed: int, total: int) -> Pane
     )
 
 
-def source_state_path(cfg: dict[str, Any], source_file: str) -> Path:
+def local_work_root(cfg: dict[str, Any]) -> Path:
+    """Return the resumable local root, optionally on persistent storage."""
     output = cfg["output"]
-    return (
-        Path(output.get("local_dir", "work/smol_stage1")) / cfg["name"]
-        / str(output.get("run_id", "v1")) / "staging" / file_key(source_file) / "state.json"
-    )
+    persistent_root = os.environ.get("SMOL_PERSIST_ROOT")
+    if persistent_root:
+        return Path(persistent_root).expanduser() / cfg["name"] / str(output.get("run_id", "v1"))
+    return Path(output.get("local_dir", "work/smol_stage1")) / cfg["name"] / str(output.get("run_id", "v1"))
+
+
+def source_state_path(cfg: dict[str, Any], source_file: str) -> Path:
+    return local_work_root(cfg) / "staging" / file_key(source_file) / "state.json"
 
 
 def save_source_state(path: Path, state: dict[str, Any]) -> None:
@@ -287,17 +292,27 @@ def build_buffer_transaction(
 def load_domain_state(
     local_state: Path, repo_id: str, remote_state: str, revision: str, token: str, resume: bool,
 ) -> dict[str, Any]:
-    if resume:
-        remote = download_json_if_present(repo_id, remote_state, revision, token)
-        if remote is not None:
-            if "completed_sources" not in remote:
-                return empty_domain_state()
-            write_json(local_state, remote)
-            return remote
-        if local_state.is_file():
-            local = json.loads(local_state.read_text(encoding="utf-8"))
-            return local if "completed_sources" in local else empty_domain_state()
-    return empty_domain_state()
+    """Load the newest usable checkpoint, preferring persistent local progress."""
+    local: dict[str, Any] | None = None
+    if local_state.is_file():
+        candidate = json.loads(local_state.read_text(encoding="utf-8"))
+        if "completed_sources" in candidate:
+            local = candidate
+    if not resume:
+        return empty_domain_state()
+    remote = download_json_if_present(repo_id, remote_state, revision, token)
+    if remote is None:
+        return local or empty_domain_state()
+    if "completed_sources" not in remote:
+        return local or empty_domain_state()
+    local_completed = len((local or {}).get("completed_sources", []))
+    remote_completed = len(remote.get("completed_sources", []))
+    if local is not None and (
+        bool(local.get("local_checkpoint")) or local_completed > remote_completed
+    ):
+        return local
+    write_json(local_state, remote)
+    return remote
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -314,6 +329,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--run-id", default=None, help="Override config run_id, useful for smoke tests")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument(
+        "--remote-checkpoint-files", type=int, default=None,
+        help="Upload the remote remainder/progress every N files; 0 means only full-shard/final checkpoints",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -349,6 +368,13 @@ def main(argv: list[str] | None = None) -> None:
     domain = str(output.get("domain", cfg["name"].replace("_", "-"))).strip("/")
     remote_prefix = output_prefix(str(output.get("path_prefix", "")), domain)
     target_size_mb = int(output.get("target_size_mb", 1024))
+    remote_checkpoint_files = (
+        int(args.remote_checkpoint_files)
+        if args.remote_checkpoint_files is not None
+        else int(os.environ.get("SMOL_REMOTE_CHECKPOINT_FILES", "0"))
+    )
+    if remote_checkpoint_files < 0:
+        raise ValueError("--remote-checkpoint-files must be non-negative")
     max_inflight = max(1, min(args.max_inflight_files or args.workers, len(source_files)))
     if args.dry_run:
         plan = Table(box=None, show_header=False, padding=(0, 1))
@@ -368,7 +394,7 @@ def main(argv: list[str] | None = None) -> None:
 
     ensure_dataset_repo(api, output["repo_id"], token, private=bool(output.get("private", True)))
     run_id = str(output.get("run_id", "v1"))
-    local_root = Path(output.get("local_dir", "work/smol_stage1")) / cfg["name"] / run_id
+    local_root = local_work_root(cfg)
     local_root.mkdir(parents=True, exist_ok=True)
     local_progress = local_root / "progress.json"
     local_buffer = local_root / "buffer.parquet"
@@ -377,11 +403,15 @@ def main(argv: list[str] | None = None) -> None:
         local_progress, output["repo_id"], remote_state, output.get("revision", "main"),
         token, not args.no_resume,
     )
-    if not args.no_resume and state.get("completed_sources"):
+    if not args.no_resume and state.get("completed_sources") and not state.get("local_checkpoint"):
         download_file_if_present(
             output["repo_id"], f"{remote_prefix}/buffer.parquet", output.get("revision", "main"),
             token, local_buffer,
         )
+    pending_parts = [Path(value) for value in state.get("pending_parts", [])]
+    missing_pending = [path for path in pending_parts if not path.is_file()]
+    if missing_pending:
+        raise RuntimeError(f"Persistent checkpoint references missing pending files: {missing_pending[:3]}")
     completed_sources = {int(value) for value in state.get("completed_sources", [])}
     selected_indices = [index for index, _ in source_files]
     remaining = [(index, filename) for index, filename in source_files if index not in completed_sources]
@@ -451,31 +481,25 @@ def main(argv: list[str] | None = None) -> None:
                             **dict(statuses.get(source_file, {})),
                             "state": "buffering", "detail": "merging into rolling buffer",
                         }
-                        current_buffer = local_buffer if completed_sources else local_root / ".aggregate" / "no-current-buffer"
-                        buffer_next, shards, next_shard = build_buffer_transaction(
-                            current_buffer, [Path(value) for value in result.get("staging_parts", [])],
-                            local_root / ".aggregate", domain, int(state.get("next_shard", 0)),
-                            target_size_mb * 1024 * 1024, int(output.get("buffer_batch_rows", 4096)),
-                        )
-                        statuses[source_file] = {
-                            **dict(statuses.get(source_file, {})),
-                            "state": "uploading",
-                            "detail": f"uploading {len(shards)} full shard(s)",
-                        }
-                        live.update(status_panel(domain, statuses, len(completed_sources & set(selected_indices)), len(source_files)))
-                        for shard_index, shard_path in shards:
-                            remote_part = f"{remote_prefix}/{domain}_shard_{shard_index:05d}.parquet"
-                            upload_file(api, output["repo_id"], shard_path, remote_part, token)
-                        upload_file(api, output["repo_id"], buffer_next, f"{remote_prefix}/buffer.parquet", token)
-                        statuses[source_file] = {
-                            **dict(statuses.get(source_file, {})),
-                            "state": "uploaded", "detail": "buffer and shards uploaded",
-                        }
-                        live.update(status_panel(domain, statuses, len(completed_sources & set(selected_indices)), len(source_files)))
-
+                        new_parts = [Path(value) for value in result.get("staging_parts", [])]
+                        pending_parts.extend(new_parts)
+                        pending_bytes = (
+                            local_buffer.stat().st_size if local_buffer.is_file() else 0
+                        ) + sum(path.stat().st_size for path in pending_parts)
                         rejected_counts = Counter(state.get("rejected_by_reason", {}))
                         rejected_counts.update(result.get("rejected_by_reason", {}))
                         completed_sources.add(index)
+                        finished_after_source = all(value in completed_sources for value in selected_indices)
+                        files_since_remote_checkpoint = int(state.get("files_since_remote_checkpoint", 0)) + 1
+                        should_remote_checkpoint = (
+                            pending_bytes >= target_size_mb * 1024 * 1024
+                            or finished_after_source
+                            or (
+                                remote_checkpoint_files > 0
+                                and files_since_remote_checkpoint >= remote_checkpoint_files
+                            )
+                        )
+                        next_shard = int(state.get("next_shard", 0))
                         state.update({
                             "stage": 1, "name": cfg["name"], "domain": domain, "run_id": run_id,
                             "completed_sources": sorted(completed_sources), "next_shard": next_shard,
@@ -484,20 +508,52 @@ def main(argv: list[str] | None = None) -> None:
                             "rejected": int(state.get("rejected", 0)) + int(result.get("rejected", 0)),
                             "estimated_tokens": int(state.get("estimated_tokens", 0)) + int(result.get("estimated_tokens", 0)),
                             "rejected_by_reason": dict(rejected_counts),
-                            "buffer_bytes": buffer_next.stat().st_size,
-                            "finished": all(value in completed_sources for value in selected_indices),
+                            "buffer_bytes": pending_bytes,
+                            "pending_parts": [str(path) for path in pending_parts],
+                            "finished": finished_after_source,
+                            "files_since_remote_checkpoint": files_since_remote_checkpoint,
+                            "local_checkpoint": True,
                         })
-                        transaction_progress = local_root / ".aggregate" / "progress.json"
-                        write_json(transaction_progress, state)
-                        upload_file(api, output["repo_id"], transaction_progress, remote_state, token)
-                        upload_file(api, output["repo_id"], transaction_progress, f"{remote_prefix}/progress.json", token)
-                        os.replace(buffer_next, local_buffer)
+                        if should_remote_checkpoint:
+                            current_buffer = local_buffer if local_buffer.is_file() else local_root / ".aggregate" / "no-current-buffer"
+                            buffer_next, shards, next_shard = build_buffer_transaction(
+                                current_buffer, pending_parts, local_root / ".aggregate", domain,
+                                next_shard, target_size_mb * 1024 * 1024,
+                                int(output.get("buffer_batch_rows", 4096)),
+                            )
+                            statuses[source_file] = {
+                                **dict(statuses.get(source_file, {})),
+                                "state": "uploading",
+                                "detail": f"uploading {len(shards)} full shard(s) and checkpoint",
+                            }
+                            live.update(status_panel(domain, statuses, len(completed_sources & set(selected_indices)), len(source_files)))
+                            for shard_index, shard_path in shards:
+                                remote_part = f"{remote_prefix}/{domain}_shard_{shard_index:05d}.parquet"
+                                upload_file(api, output["repo_id"], shard_path, remote_part, token)
+                            upload_file(api, output["repo_id"], buffer_next, f"{remote_prefix}/buffer.parquet", token)
+                            state.update({
+                                "next_shard": next_shard,
+                                "buffer_bytes": buffer_next.stat().st_size,
+                                "pending_parts": [],
+                                "files_since_remote_checkpoint": 0,
+                                "local_checkpoint": False,
+                                "remote_completed_sources": sorted(completed_sources),
+                            })
+                            transaction_progress = local_root / ".aggregate" / "progress.json"
+                            write_json(transaction_progress, state)
+                            upload_file(api, output["repo_id"], transaction_progress, remote_state, token)
+                            upload_file(api, output["repo_id"], transaction_progress, f"{remote_prefix}/progress.json", token)
+                            os.replace(buffer_next, local_buffer)
+                            for path in pending_parts:
+                                path.unlink(missing_ok=True)
+                            pending_parts.clear()
+                            checkpoint_detail = "remote checkpoint saved"
+                        else:
+                            checkpoint_detail = "saved locally; remote checkpoint pending"
                         write_json(local_progress, state)
-                        for value in result.get("staging_parts", []):
-                            Path(value).unlink(missing_ok=True)
                         statuses[source_file] = {
                             **dict(statuses.get(source_file, {})),
-                            "state": "complete", "detail": "checkpoint saved",
+                            "state": "complete", "detail": checkpoint_detail,
                         }
                         next_order += 1
                     live.update(status_panel(domain, statuses, len(completed_sources & set(selected_indices)), len(source_files)))
