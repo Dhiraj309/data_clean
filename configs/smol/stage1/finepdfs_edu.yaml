@@ -25,7 +25,7 @@ required_columns:
 
 filters:
   # English-only model.
-  languages: [en]
+  languages: [eng_Latn]
 
   # Keep substantial long-form educational / academic PDF content.
   min_token_count: 1024
