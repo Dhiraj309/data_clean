@@ -7,12 +7,13 @@ import copy
 import json
 import os
 import shutil
+import sys
 import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from itertools import chain, islice
-from multiprocessing import Manager, get_context
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -315,6 +316,40 @@ def _filter_row_group(task: dict[str, Any]) -> dict[str, Any]:
     }
     write_json(result_path, result)
     return result
+
+
+def _worker_process_ready() -> int:
+    """Small startup probe used to create the process pool from the main thread."""
+    return os.getpid()
+
+
+def _select_process_start_method(
+    configured: str | None, platform_name: str, notebook_run: bool,
+) -> str:
+    if notebook_run:
+        if platform_name == "nt":
+            raise RuntimeError(
+                "Multiprocessing through notebook %run is unsupported on Windows. "
+                "Run `python -u smol_stage1_filter.py ...` in a terminal instead."
+            )
+        return "fork"
+    if configured:
+        return configured
+    return "spawn" if platform_name == "nt" else "forkserver"
+
+
+def resolve_process_start_method(requested: str | None = None) -> str:
+    """Choose a multiprocessing mode that also works with IPython ``%run``.
+
+    Python 3.12's spawn/forkserver preparation reads ``__main__.__spec__``.
+    IPython's ``%run`` main module may not define that attribute, so POSIX
+    notebooks must use ``fork``. Normal CLI runs retain the safer forkserver
+    default, while Windows continues to use spawn.
+    """
+    configured = requested or os.environ.get("SMOL_PROCESS_START_METHOD")
+    main_module = sys.modules.get("__main__")
+    notebook_run = main_module is not None and not hasattr(main_module, "__spec__")
+    return _select_process_start_method(configured, os.name, notebook_run)
 
 
 def _summarize_row_groups(
@@ -660,10 +695,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--process-start-method",
         choices=("spawn", "forkserver", "fork"),
-        default=os.environ.get(
-            "SMOL_PROCESS_START_METHOD", "spawn" if os.name == "nt" else "forkserver",
+        default=None,
+        help=(
+            "Multiprocessing start method for the shared row-group worker pool; "
+            "auto-selects fork for POSIX notebook %run sessions"
         ),
-        help="Multiprocessing start method for the shared row-group worker pool",
     )
     parser.add_argument(
         "--start-file", type=int, default=0,
@@ -743,6 +779,7 @@ def main(argv: list[str] | None = None) -> None:
     active_files, workers_per_file = resolve_hybrid_layout(
         args.workers, len(source_files), requested_active_files, requested_workers_per_file,
     )
+    process_start_method = resolve_process_start_method(args.process_start_method)
     if args.dry_run:
         plan = Table(box=None, show_header=False, padding=(0, 1))
         plan.add_column("Field", style="cyan")
@@ -758,7 +795,7 @@ def main(argv: list[str] | None = None) -> None:
         plan.add_row("Workers per file", str(workers_per_file))
         plan.add_row("Source batch rows", f"{args.source_batch_rows:,}")
         plan.add_row("Keep source files", str(args.keep_source_files))
-        plan.add_row("Process start", args.process_start_method)
+        plan.add_row("Process start", process_start_method)
         plan.add_row("Resume", str(not args.no_resume))
         console.print(Panel(plan, title=f"Stage 1 dry-run · {domain}", border_style="cyan"))
         return
@@ -804,12 +841,15 @@ def main(argv: list[str] | None = None) -> None:
     with ExitStack() as stack:
         process_executor = stack.enter_context(ProcessPoolExecutor(
             max_workers=args.workers,
-            mp_context=get_context(args.process_start_method),
+            mp_context=get_context(process_start_method),
         ))
-        manager = stack.enter_context(Manager())
+        # Start workers here, before file coordinator threads exist. This is
+        # required for safe POSIX fork usage under IPython/Kaggle notebooks.
+        process_executor.submit(_worker_process_ready).result()
         for job in jobs:
             job["process_executor"] = process_executor
-        statuses = manager.dict()
+        # Status is updated only by file coordinator threads, never subprocesses.
+        statuses: dict[str, dict[str, Any]] = {}
         for job in jobs:
             job["status"] = statuses
         for job in jobs:

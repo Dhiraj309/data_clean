@@ -16,6 +16,17 @@ def test_resolve_hybrid_layout_uses_bounded_file_concurrency() -> None:
     assert stage1.resolve_hybrid_layout(24, 10, 4, 12) == (4, 6)
 
 
+def test_notebook_run_uses_fork_on_posix() -> None:
+    assert stage1._select_process_start_method(None, "posix", True) == "fork"
+    assert stage1._select_process_start_method("forkserver", "posix", True) == "fork"
+
+
+def test_normal_run_keeps_requested_start_method() -> None:
+    assert stage1._select_process_start_method("spawn", "posix", False) == "spawn"
+    assert stage1._select_process_start_method(None, "posix", False) == "forkserver"
+    assert stage1._select_process_start_method(None, "nt", False) == "spawn"
+
+
 def test_parallel_row_groups_filter_and_resume(tmp_path: Path, monkeypatch) -> None:
     source_path = tmp_path / "source.parquet"
     table = pa.table(
