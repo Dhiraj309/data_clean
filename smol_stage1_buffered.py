@@ -9,9 +9,10 @@ import os
 import shutil
 import time
 from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from contextlib import ExitStack
 from itertools import chain, islice
-from multiprocessing import Manager
+from multiprocessing import Manager, get_context
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -123,7 +124,7 @@ def save_source_state(path: Path, state: dict[str, Any]) -> None:
     write_json(path, state)
 
 
-def filter_source_file(job: dict[str, Any]) -> dict[str, Any]:
+def filter_source_file_streaming(job: dict[str, Any]) -> dict[str, Any]:
     """Filter one source file to local staging Parquet pieces; workers never upload."""
     cfg = job["cfg"]
     source = cfg["source"]
@@ -210,6 +211,289 @@ def filter_source_file(job: dict[str, Any]) -> dict[str, Any]:
     save_source_state(state_path, result)
     publish_status(job, rows_seen, accepted, sum(rejected.values()), "complete", "staged locally")
     return {**result, "result_status": "staged"}
+
+
+_NORMALIZED_SOURCE_FIELDS = (
+    "text", "id", "url", "language", "dataset", "language_score",
+    "fasttext_score", "score", "answer_count", "accepted_answer_id",
+    "int_score", "token_count",
+)
+
+
+def _parts_exist(result: dict[str, Any]) -> bool:
+    return all(Path(value).is_file() for value in result.get("staging_parts", []))
+
+
+def _row_group_dir(parts_dir: Path, row_group: int) -> Path:
+    return parts_dir / f"row-group-{row_group:05d}"
+
+
+def _load_row_group_result(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not result.get("finished") or not _parts_exist(result):
+        return None
+    return result
+
+
+def _source_read_columns(cfg: dict[str, Any], available: list[str]) -> list[str]:
+    """Read only fields used by normalization/filtering, avoiding large PDF metadata columns."""
+    columns = cfg.get("columns", {})
+    requested: list[str] = []
+    for logical_name in _NORMALIZED_SOURCE_FIELDS:
+        value = columns.get(logical_name, logical_name)
+        if value:
+            requested.append(str(value).split(".", 1)[0])
+    for value in cfg.get("required_columns", []):
+        requested.append(str(value).split(".", 1)[0])
+    available_set = set(available)
+    return list(dict.fromkeys(value for value in requested if value in available_set))
+
+
+def _filter_row_group(task: dict[str, Any]) -> dict[str, Any]:
+    """Filter one local Parquet row group into deterministic staging parts."""
+    cfg = task["cfg"]
+    row_group = int(task["row_group"])
+    parts_dir = Path(task["parts_dir"])
+    result_dir = _row_group_dir(parts_dir, row_group)
+    result_path = result_dir / "result.json"
+    if task.get("resume"):
+        previous = _load_row_group_result(result_path)
+        if previous is not None:
+            return previous
+
+    if result_dir.exists():
+        shutil.rmtree(result_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    writer = ShardWriter(
+        result_dir,
+        target_size_mb=int(cfg["output"].get("staging_size_mb", 128)),
+        max_documents=int(cfg["output"].get("staging_max_documents", 250_000)),
+    )
+    parquet = pq.ParquetFile(task["local_source"])
+    rejected: Counter[str] = Counter()
+    rows_seen = 0
+    accepted = 0
+    estimated_tokens = 0
+    staging_parts: list[str] = []
+    started = time.perf_counter()
+    for batch in parquet.iter_batches(
+        row_groups=[row_group],
+        columns=task["read_columns"],
+        batch_size=int(task["source_batch_rows"]),
+        use_threads=False,
+    ):
+        for raw in batch.to_pylist():
+            rows_seen += 1
+            row = normalize_row(raw, cfg, cfg["name"])
+            ok, reason = accepts(row, cfg.get("filters", {}))
+            if not ok:
+                rejected[reason or "rejected"] += 1
+                continue
+            accepted += 1
+            estimated_tokens += int(row["estimated_tokens"] or 1)
+            part = writer.add(row)
+            if part is not None:
+                staging_parts.append(str(part))
+    part = writer.flush()
+    if part is not None:
+        staging_parts.append(str(part))
+    result = {
+        "row_group": row_group,
+        "rows_seen": rows_seen,
+        "accepted": accepted,
+        "rejected": sum(rejected.values()),
+        "rejected_by_reason": dict(rejected),
+        "estimated_tokens": estimated_tokens,
+        "staging_parts": staging_parts,
+        "finished": True,
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+    }
+    write_json(result_path, result)
+    return result
+
+
+def _summarize_row_groups(
+    job: dict[str, Any], row_group_results: dict[int, dict[str, Any]],
+    total_row_groups: int, started: float,
+) -> dict[str, Any]:
+    rejected: Counter[str] = Counter()
+    staging_parts: list[str] = []
+    rows_seen = 0
+    accepted = 0
+    estimated_tokens = 0
+    for row_group in sorted(row_group_results):
+        result = row_group_results[row_group]
+        rows_seen += int(result.get("rows_seen", 0))
+        accepted += int(result.get("accepted", 0))
+        estimated_tokens += int(result.get("estimated_tokens", 0))
+        rejected.update(result.get("rejected_by_reason", {}))
+        staging_parts.extend(str(value) for value in result.get("staging_parts", []))
+    finished = len(row_group_results) == total_row_groups
+    return {
+        "mode": "row_groups",
+        "source_file": job["source_file"],
+        "source_index": int(job["source_index"]),
+        "rows_seen": rows_seen,
+        "accepted": accepted,
+        "rejected": sum(rejected.values()),
+        "rejected_by_reason": dict(rejected),
+        "estimated_tokens": estimated_tokens,
+        "next_part": len(staging_parts),
+        "staging_parts": staging_parts,
+        "total_row_groups": total_row_groups,
+        "completed_row_groups": sorted(row_group_results),
+        "row_group_results": {
+            str(index): row_group_results[index] for index in sorted(row_group_results)
+        },
+        "finished": finished,
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+    }
+
+
+def _download_source_file(job: dict[str, Any]) -> Path:
+    cfg = job["cfg"]
+    download_root = local_work_root(cfg) / "downloads"
+    download_root.mkdir(parents=True, exist_ok=True)
+    local = hf_hub_download(
+        repo_id=cfg["source"]["repo_id"],
+        filename=job["source_file"],
+        repo_type="dataset",
+        revision=cfg["source"].get("revision", "main"),
+        token=job["token"],
+        local_dir=str(download_root),
+    )
+    return Path(local)
+
+
+def filter_source_file(job: dict[str, Any]) -> dict[str, Any]:
+    """Filter one source using parallel Parquet row groups when safe to do so."""
+    workers_per_file = max(1, int(job.get("workers_per_file", 1)))
+    state_path = source_state_path(job["cfg"], job["source_file"])
+    previous: dict[str, Any] = {}
+    if job["resume"] and state_path.is_file():
+        previous = json.loads(state_path.read_text(encoding="utf-8"))
+        if previous.get("finished") and _parts_exist(previous):
+            publish_status(
+                job, int(previous.get("rows_seen", 0)), int(previous.get("accepted", 0)),
+                int(previous.get("rejected", 0)), "complete", "resumed",
+            )
+            return {**previous, "result_status": "staged"}
+
+    # Preserve legacy partial checkpoints and exact smoke-test row limits.
+    if (
+        workers_per_file == 1
+        or job.get("limit_rows") is not None
+        or (previous and previous.get("mode") != "row_groups")
+    ):
+        return filter_source_file_streaming(job)
+
+    started = time.perf_counter()
+    publish_status(job, 0, 0, 0, "loading", "downloading source")
+    local_source = _download_source_file(job)
+    parquet = pq.ParquetFile(local_source)
+    available = list(parquet.schema_arrow.names)
+    required = job["cfg"].get(
+        "required_columns", [job["cfg"].get("columns", {}).get("text", "text")],
+    )
+    missing = [
+        value for value in required if str(value).split(".", 1)[0] not in set(available)
+    ]
+    if missing:
+        raise RuntimeError(
+            f"{job['source_file']}: missing required columns {missing}; available={sorted(available)}"
+        )
+    total_row_groups = parquet.num_row_groups
+    parts_dir = state_path.parent / "parts"
+    row_group_results: dict[int, dict[str, Any]] = {}
+    if previous.get("mode") == "row_groups":
+        for key, value in previous.get("row_group_results", {}).items():
+            if value.get("finished") and _parts_exist(value):
+                row_group_results[int(key)] = value
+    for row_group in range(total_row_groups):
+        recovered = _load_row_group_result(
+            _row_group_dir(parts_dir, row_group) / "result.json",
+        )
+        if recovered is not None:
+            row_group_results[row_group] = recovered
+
+    summary = _summarize_row_groups(job, row_group_results, total_row_groups, started)
+    publish_status(
+        job, int(summary["rows_seen"]), int(summary["accepted"]), int(summary["rejected"]),
+        "processing", f"row groups {len(row_group_results)}/{total_row_groups}",
+    )
+    missing_row_groups = [
+        row_group for row_group in range(total_row_groups)
+        if row_group not in row_group_results
+    ]
+    if missing_row_groups:
+        read_columns = _source_read_columns(job["cfg"], available)
+        max_workers = min(workers_per_file, len(missing_row_groups))
+        tasks = [
+            {
+                "cfg": job["cfg"],
+                "local_source": str(local_source),
+                "parts_dir": str(parts_dir),
+                "row_group": row_group,
+                "read_columns": read_columns,
+                "source_batch_rows": int(job.get("source_batch_rows", 1024)),
+                "resume": job["resume"],
+            }
+            for row_group in missing_row_groups
+        ]
+        def process_tasks(executor: ProcessPoolExecutor) -> None:
+            task_iter = iter(tasks)
+            pending: dict[Any, int] = {}
+            for _ in range(max_workers):
+                try:
+                    task = next(task_iter)
+                except StopIteration:
+                    break
+                pending[executor.submit(_filter_row_group, task)] = int(task["row_group"])
+            while pending:
+                done, _ = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                for future in done:
+                    row_group = pending.pop(future)
+                    row_group_results[row_group] = future.result()
+                    summary = _summarize_row_groups(
+                        job, row_group_results, total_row_groups, started,
+                    )
+                    save_source_state(state_path, summary)
+                    publish_status(
+                        job, int(summary["rows_seen"]), int(summary["accepted"]),
+                        int(summary["rejected"]), "processing",
+                        f"row groups {len(row_group_results)}/{total_row_groups}",
+                    )
+                    try:
+                        task = next(task_iter)
+                    except StopIteration:
+                        continue
+                    pending[executor.submit(_filter_row_group, task)] = int(task["row_group"])
+
+        shared_executor = job.get("process_executor")
+        if shared_executor is not None:
+            process_tasks(shared_executor)
+        else:
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=get_context("spawn"),
+            ) as local_executor:
+                process_tasks(local_executor)
+
+    summary = _summarize_row_groups(job, row_group_results, total_row_groups, started)
+    save_source_state(state_path, summary)
+    del parquet
+    if not job.get("keep_source_files"):
+        local_source.unlink(missing_ok=True)
+    publish_status(
+        job, int(summary["rows_seen"]), int(summary["accepted"]), int(summary["rejected"]),
+        "complete", f"staged {total_row_groups} row groups locally",
+    )
+    return {**summary, "result_status": "staged"}
 
 
 def download_file_if_present(
@@ -315,11 +599,72 @@ def load_domain_state(
     return remote
 
 
+def resolve_hybrid_layout(
+    worker_budget: int,
+    file_count: int,
+    requested_active_files: int | None,
+    requested_workers_per_file: int | None,
+) -> tuple[int, int]:
+    """Choose bounded file concurrency while keeping the process budget explicit."""
+    if requested_active_files is None:
+        if worker_budget < 8:
+            active_files = 1
+        elif worker_budget <= 48:
+            active_files = 2
+        else:
+            active_files = min(4, max(2, worker_budget // 16))
+    else:
+        active_files = int(requested_active_files)
+    if active_files < 1:
+        raise ValueError("--active-files/--max-inflight-files must be positive")
+    active_files = min(active_files, file_count, worker_budget)
+    budget_per_file = max(1, worker_budget // active_files)
+    workers_per_file = (
+        budget_per_file
+        if requested_workers_per_file is None
+        else min(int(requested_workers_per_file), budget_per_file)
+    )
+    if workers_per_file < 1:
+        raise ValueError("--workers-per-file must be positive")
+    return active_files, workers_per_file
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--workers", type=int, default=max(1, min(4, os.cpu_count() or 1)))
-    parser.add_argument("--max-inflight-files", type=int, default=None)
+    parser.add_argument(
+        "--workers", type=int, default=max(1, min(4, os.cpu_count() or 1)),
+        help="Total row-group processing process budget",
+    )
+    parser.add_argument(
+        "--active-files", type=int, default=None,
+        help="Source files processed concurrently; chosen automatically when omitted",
+    )
+    parser.add_argument(
+        "--workers-per-file", type=int, default=None,
+        help="Maximum row-group workers assigned to each active source file",
+    )
+    parser.add_argument(
+        "--max-inflight-files", type=int, default=None,
+        help="Backward-compatible alias for --active-files",
+    )
+    parser.add_argument(
+        "--source-batch-rows", type=int,
+        default=int(os.environ.get("SMOL_SOURCE_BATCH_ROWS", "1024")),
+        help="Rows converted at once inside each Parquet row-group worker",
+    )
+    parser.add_argument(
+        "--keep-source-files", action="store_true",
+        help="Retain locally downloaded source Parquet files after staging completes",
+    )
+    parser.add_argument(
+        "--process-start-method",
+        choices=("spawn", "forkserver", "fork"),
+        default=os.environ.get(
+            "SMOL_PROCESS_START_METHOD", "spawn" if os.name == "nt" else "forkserver",
+        ),
+        help="Multiprocessing start method for the shared row-group worker pool",
+    )
     parser.add_argument(
         "--start-file", type=int, default=0,
         help="Zero-based offset into the sorted source file list",
@@ -343,6 +688,8 @@ def main(argv: list[str] | None = None) -> None:
         raise RuntimeError(f"Stage-1 config {cfg.get('name', args.config)!r} is disabled: {reason}")
     if args.workers < 1:
         raise ValueError("--workers must be positive")
+    if args.source_batch_rows < 1:
+        raise ValueError("--source-batch-rows must be positive")
     if args.start_file < 0:
         raise ValueError("--start-file must be non-negative")
     if args.limit_files is not None and args.limit_files < 1:
@@ -375,7 +722,27 @@ def main(argv: list[str] | None = None) -> None:
     )
     if remote_checkpoint_files < 0:
         raise ValueError("--remote-checkpoint-files must be non-negative")
-    max_inflight = max(1, min(args.max_inflight_files or args.workers, len(source_files)))
+    env_active_files = os.environ.get("SMOL_ACTIVE_FILES")
+    env_workers_per_file = os.environ.get("SMOL_WORKERS_PER_FILE")
+    requested_active_files = (
+        args.active_files
+        if args.active_files is not None
+        else args.max_inflight_files
+        if args.max_inflight_files is not None
+        else int(env_active_files)
+        if env_active_files
+        else None
+    )
+    requested_workers_per_file = (
+        args.workers_per_file
+        if args.workers_per_file is not None
+        else int(env_workers_per_file)
+        if env_workers_per_file
+        else None
+    )
+    active_files, workers_per_file = resolve_hybrid_layout(
+        args.workers, len(source_files), requested_active_files, requested_workers_per_file,
+    )
     if args.dry_run:
         plan = Table(box=None, show_header=False, padding=(0, 1))
         plan.add_column("Field", style="cyan")
@@ -386,8 +753,12 @@ def main(argv: list[str] | None = None) -> None:
         plan.add_row("Output", f"{output['repo_id']}/{remote_prefix}")
         plan.add_row("Full shards", f"{domain}_shard_00000.parquet (~{target_size_mb / 1024:.2f} GiB)")
         plan.add_row("Remainder", f"{remote_prefix}/buffer.parquet")
-        plan.add_row("Workers", str(args.workers))
-        plan.add_row("Max in-flight", str(max_inflight))
+        plan.add_row("Processing workers", str(args.workers))
+        plan.add_row("Active files", str(active_files))
+        plan.add_row("Workers per file", str(workers_per_file))
+        plan.add_row("Source batch rows", f"{args.source_batch_rows:,}")
+        plan.add_row("Keep source files", str(args.keep_source_files))
+        plan.add_row("Process start", args.process_start_method)
         plan.add_row("Resume", str(not args.no_resume))
         console.print(Panel(plan, title=f"Stage 1 dry-run · {domain}", border_style="cyan"))
         return
@@ -422,12 +793,22 @@ def main(argv: list[str] | None = None) -> None:
     jobs = [{
         "cfg": cfg, "source_file": filename, "source_index": index, "token": token,
         "limit_rows": args.limit_rows, "resume": not args.no_resume,
+        "workers_per_file": workers_per_file,
+        "source_batch_rows": args.source_batch_rows,
+        "keep_source_files": args.keep_source_files,
     } for index, filename in remaining]
     ordered_indices = [index for index, _ in remaining]
     ready: dict[int, dict[str, Any]] = {}
     next_order = 0
 
-    with Manager() as manager:
+    with ExitStack() as stack:
+        process_executor = stack.enter_context(ProcessPoolExecutor(
+            max_workers=args.workers,
+            mp_context=get_context(args.process_start_method),
+        ))
+        manager = stack.enter_context(Manager())
+        for job in jobs:
+            job["process_executor"] = process_executor
         statuses = manager.dict()
         for job in jobs:
             job["status"] = statuses
@@ -444,8 +825,10 @@ def main(argv: list[str] | None = None) -> None:
             console=console, refresh_per_second=2,
             auto_refresh=console.is_terminal or console.is_jupyter,
         ) as live:
-            with ProcessPoolExecutor(max_workers=args.workers) as executor:
-                for _ in range(max_inflight):
+            # File coordinators share one process budget and cap their own in-flight row groups.
+            # The main thread remains the only rolling-buffer writer/uploader.
+            with ThreadPoolExecutor(max_workers=active_files) as executor:
+                for _ in range(active_files):
                     try:
                         job = next(job_iter)
                     except StopIteration:

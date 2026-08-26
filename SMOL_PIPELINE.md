@@ -2,10 +2,10 @@
 
 This is the new lightweight path for Smol Data sources. It deliberately has only two data-processing stages:
 
-1. Stage 1 lists the source Parquet files, processes one source file per worker, applies row-level filters, and merges completed files in source order into one persistent domain buffer. Full approximately 1 GiB Parquet shards are uploaded to the filtered-data repository.
+1. Stage 1 lists the source Parquet files, downloads a bounded number of files, filters their Parquet row groups with one shared CPU process pool, and merges completed files in source order into one persistent domain buffer. Full approximately 1 GiB Parquet shards are uploaded to the filtered-data repository.
 2. Stage 2 streams those domain folders, samples them according to the configured weights, and uploads the final training Parquet shards.
 
-The pipeline does not download a whole source to local disk, does not run the old multi-pass corpus deduplication flow, and does not mix raw sources before filtering.
+The pipeline keeps only the bounded set of active source files on local disk, removes each download after its staging checkpoint completes, does not run the old multi-pass corpus deduplication flow, and does not mix raw sources before filtering.
 
 ## Minimal live logging
 
@@ -44,7 +44,7 @@ os.environ["FILTERED_REPO"] = f'{os.environ["HF_USER"]}/LaughLM-Filtered-Smol'
 
 Do not commit the token to a notebook or repository. Prefer a Kaggle secret and assign its value to `HF_TOKEN`.
 
-## Stage 1: one source at a time
+## Stage 1: bounded hybrid processing
 
 First inspect the source schema without creating the output repository:
 
@@ -62,7 +62,8 @@ python -u smol_stage1_filter.py \
   --limit-files 1 \
   --limit-rows 10000 \
   --workers 2 \
-  --max-inflight-files 1 \
+  --active-files 1 \
+  --workers-per-file 2 \
   --run-id smoke \
   --no-resume
 ```
@@ -70,9 +71,9 @@ python -u smol_stage1_filter.py \
 Then run each source separately. The following commands are intentionally sequential:
 
 ```bash
-python -u smol_stage1_filter.py --config configs/smol/stage1/dclm.yaml --workers 12 --max-inflight-files 6
-python -u smol_stage1_filter.py --config configs/smol/stage1/fineweb_edu.yaml --workers 12 --max-inflight-files 6
-python -u smol_stage1_filter.py --config configs/smol/stage1/finepdfs_edu.yaml --workers 12 --max-inflight-files 6
+python -u smol_stage1_filter.py --config configs/smol/stage1/dclm.yaml --workers 24 --active-files 2 --workers-per-file 12
+python -u smol_stage1_filter.py --config configs/smol/stage1/fineweb_edu.yaml --workers 24 --active-files 2 --workers-per-file 12
+python -u smol_stage1_filter.py --config configs/smol/stage1/finepdfs_edu.yaml --workers 24 --active-files 2 --workers-per-file 12
 ```
 
 To process files in deterministic batches, use the zero-based `--start-file` offset together with `--limit-files`. For batches of 20 files:
@@ -100,7 +101,9 @@ LaughLM-Filtered-Smol/
 └── _checkpoints/stage1/v1/...
 ```
 
-Workers write 128 MiB local staging pieces so filtering remains memory-safe. The parent process consumes completed sources in deterministic source order and rewrites `buffer.parquet` after each source. Whenever the compressed buffer crosses the configured 1024 MiB target, it becomes `domain_shard_00000.parquet`, `domain_shard_00001.parquet`, and so on; only the remainder stays in `buffer.parquet`. Both the remainder and `progress.json` are uploaded after each source, so another machine can resume from the last committed source. Because Parquet compression and row groups are indivisible, full shards are close to 1 GiB rather than byte-for-byte identical.
+`--workers` is the total CPU process budget. `--active-files` bounds source-file concurrency, and `--workers-per-file` caps the row groups from each file that may occupy that pool. When these values are omitted, Stage 1 chooses one active file below 8 workers, two active files from 8 through 48 workers, and at most four above that. `--max-inflight-files` remains a backward-compatible alias for `--active-files`.
+
+Row-group workers write 128 MiB local staging pieces so filtering remains memory-safe. They never write the shared buffer and never upload. The coordinator consumes completed sources in deterministic source order and is the only owner of `buffer.parquet`, shard numbering, and Hub uploads. Filtering of other active files continues while the coordinator compacts or uploads a full shard. Each row-group result has its own manifest, so an interrupted file resumes only its unfinished row groups. Whenever the compressed buffer crosses the configured 1024 MiB target, it becomes `domain_shard_00000.parquet`, `domain_shard_00001.parquet`, and so on; only the remainder stays in `buffer.parquet`. Because Parquet compression and row groups are indivisible, full shards are close to 1 GiB rather than byte-for-byte identical.
 
 The filters are in the individual YAML files. They currently require English, use a minimum language score of `0.95`, require at least 50 words and 200 characters, and apply source-specific quality fields when available. `missing_policy: ignore` means a source without a particular optional score is not rejected for that missing score; `missing_policy: reject` is used for DCLM's required score fields.
 

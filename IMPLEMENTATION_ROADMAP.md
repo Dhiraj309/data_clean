@@ -16,7 +16,7 @@ Status markers:
 
 ```text
 HF source datasets
-    -> Stage 1 filtering, one file at a time
+    -> Stage 1 bounded hybrid filtering by file and Parquet row group
     -> fixed-size filtered Parquet shards
     -> Stage 2 token-aware mixing
     -> tokenizer and train/validation manifests
@@ -30,7 +30,7 @@ HF source datasets
 | Decision | POC policy |
 |---|---|
 | Dataset source | Use upstream HF Smol/pretraining datasets |
-| Processing | Stream one source file at a time with resumable checkpoints |
+| Processing | Bound active files and parallelize their Parquet row groups with resumable checkpoints |
 | Filter output | Fixed-size Parquet shards plus a resumable buffer |
 | Mixing | Match target percentages by tokens, not document rows |
 | Deduplication | Use upstream deduplication and lightweight local exact hashing |
@@ -50,8 +50,8 @@ HF source datasets
 
 ### DC-2: Stage 1 filtering
 
-- `[~]` Keep file-at-a-time streaming and bounded local staging.
-- `[~]` Keep resumable source-file checkpoints.
+- `[x]` Bound active files and share one CPU process budget across per-file row-group work.
+- `[x]` Keep resumable source-file and row-group checkpoints.
 - `[~]` Keep fixed-size filtered Parquet shards and `buffer.parquet`.
 - `[~]` Keep compact single-table progress logging.
 - `[ ]` Verify every dataset-specific YAML threshold against the source schema.
