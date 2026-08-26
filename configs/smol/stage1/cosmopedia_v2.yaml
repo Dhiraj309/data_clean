@@ -21,7 +21,7 @@ required_columns:
 
 filters:
   # Keep substantive educational samples while preserving topic diversity.
-  min_token_count: 256
+  min_token_count: 512
 
   # Primarily corruption/outlier guards; not intended to aggressively
   # remove legitimate long-form Cosmopedia content.

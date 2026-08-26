@@ -1,39 +1,82 @@
 stage: 2
-name: smol-v1-mix
+name: laughlm-v1-pretraining-mix
 seed: 42
 
-# The initial Smol Data-style mixture: 50% FinePDFs-Edu, 30% DCLM, 20% FineWeb-Edu.
-# Change these weights without changing the Stage-1 filtering jobs.
+# Baseline broad pretraining mixture. Weights are normalized by the mixer;
+# keeping them summed to 1.0 makes the intended percentages explicit.
+# Change only these weights when experimenting with another mixture.
 target_tokens: 20000000000
 sources:
-  - name: finepdfs_edu
-    repo_id: "${FILTERED_REPO}"
-    revision: main
-    path_prefix: finepdfs-edu
-    filename_prefix: finepdfs-edu
-    progress_file: progress.json
-    weight: 0.50
-  - name: dclm
-    repo_id: "${FILTERED_REPO}"
-    revision: main
-    path_prefix: dclm
-    filename_prefix: dclm
-    progress_file: progress.json
-    weight: 0.30
   - name: fineweb_edu
     repo_id: "${FILTERED_REPO}"
     revision: main
     path_prefix: fineweb-edu
     filename_prefix: fineweb-edu
     progress_file: progress.json
+    weight: 0.25
+  - name: dclm
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: dclm
+    filename_prefix: dclm
+    progress_file: progress.json
     weight: 0.20
+  - name: finepdfs_edu
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: finepdfs-edu
+    filename_prefix: finepdfs-edu
+    progress_file: progress.json
+    weight: 0.15
+  - name: cosmopedia_v2
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: cosmopedia-v2
+    filename_prefix: cosmopedia-v2
+    progress_file: progress.json
+    weight: 0.10
+  - name: finemath
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: finemath-4plus
+    filename_prefix: finemath-4plus
+    progress_file: progress.json
+    weight: 0.10
+  - name: megamath_web_pro
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: megamath-web-pro
+    filename_prefix: megamath-web-pro
+    progress_file: progress.json
+    weight: 0.07
+  - name: stackexchange_2025
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: stackexchange-2025
+    filename_prefix: stackexchange-2025
+    progress_file: progress.json
+    weight: 0.06
+  - name: issues
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: issues
+    filename_prefix: issues
+    progress_file: progress.json
+    weight: 0.04
+  - name: kaggle
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: kaggle
+    filename_prefix: kaggle
+    progress_file: progress.json
+    weight: 0.03
 
 output:
   repo_id: "${HF_USER}/laughlm-smol-v1-training"
   private: true
   run_id: v1
   path_prefix: train
-  filename_prefix: smol-v1
+  filename_prefix: laughlm-v1
   target_size_mb: 1024
   staging_size_mb: 128
   buffer_batch_rows: 4096

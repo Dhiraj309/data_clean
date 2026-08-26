@@ -30,7 +30,7 @@ filters:
   min_answer_count: 1
 
   # Preserve concise but useful technical / educational discussions.
-  min_words: 100
+  min_words: 75
   min_chars: 300
 
   # Outlier / corruption guards for extremely large rendered threads.

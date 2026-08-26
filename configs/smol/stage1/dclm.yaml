@@ -33,7 +33,7 @@ filters:
   min_fasttext_score: 0.018112
 
   # Remove very short / low-information web documents.
-  min_words: 50
+  min_words: 100
   min_chars: 400
 
   # Outlier / corruption guards.
