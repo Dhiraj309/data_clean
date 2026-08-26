@@ -521,33 +521,46 @@ def main(argv: list[str] | None = None) -> None:
                                 next_shard, target_size_mb * 1024 * 1024,
                                 int(output.get("buffer_batch_rows", 4096)),
                             )
+                            upload_remainder = finished_after_source or (
+                                remote_checkpoint_files > 0
+                                and files_since_remote_checkpoint >= remote_checkpoint_files
+                            )
                             statuses[source_file] = {
                                 **dict(statuses.get(source_file, {})),
                                 "state": "uploading",
-                                "detail": f"uploading {len(shards)} full shard(s) and checkpoint",
+                                "detail": (
+                                    f"uploading {len(shards)} full shard(s)"
+                                    + (" and remainder checkpoint" if upload_remainder else "; keeping remainder local")
+                                ),
                             }
                             live.update(status_panel(domain, statuses, len(completed_sources & set(selected_indices)), len(source_files)))
                             for shard_index, shard_path in shards:
                                 remote_part = f"{remote_prefix}/{domain}_shard_{shard_index:05d}.parquet"
                                 upload_file(api, output["repo_id"], shard_path, remote_part, token)
-                            upload_file(api, output["repo_id"], buffer_next, f"{remote_prefix}/buffer.parquet", token)
                             state.update({
                                 "next_shard": next_shard,
                                 "buffer_bytes": buffer_next.stat().st_size,
                                 "pending_parts": [],
-                                "files_since_remote_checkpoint": 0,
-                                "local_checkpoint": False,
-                                "remote_completed_sources": sorted(completed_sources),
                             })
-                            transaction_progress = local_root / ".aggregate" / "progress.json"
-                            write_json(transaction_progress, state)
-                            upload_file(api, output["repo_id"], transaction_progress, remote_state, token)
-                            upload_file(api, output["repo_id"], transaction_progress, f"{remote_prefix}/progress.json", token)
+                            if upload_remainder:
+                                upload_file(api, output["repo_id"], buffer_next, f"{remote_prefix}/buffer.parquet", token)
+                                state.update({
+                                    "files_since_remote_checkpoint": 0,
+                                    "local_checkpoint": False,
+                                    "remote_completed_sources": sorted(completed_sources),
+                                })
+                                transaction_progress = local_root / ".aggregate" / "progress.json"
+                                write_json(transaction_progress, state)
+                                upload_file(api, output["repo_id"], transaction_progress, remote_state, token)
+                                upload_file(api, output["repo_id"], transaction_progress, f"{remote_prefix}/progress.json", token)
+                                checkpoint_detail = "remote checkpoint saved"
+                            else:
+                                state["local_checkpoint"] = True
+                                checkpoint_detail = "full shard uploaded; remainder kept locally"
                             os.replace(buffer_next, local_buffer)
                             for path in pending_parts:
                                 path.unlink(missing_ok=True)
                             pending_parts.clear()
-                            checkpoint_detail = "remote checkpoint saved"
                         else:
                             checkpoint_detail = "saved locally; remote checkpoint pending"
                         write_json(local_progress, state)
