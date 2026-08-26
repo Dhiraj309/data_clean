@@ -28,6 +28,7 @@ required_columns:
 filters:
   # FineMath is already English-filtered upstream.
   languages: [en]
+  min_language_score: 0.90
 
   # FineMath-4plus already contains high-quality math documents.
   # Keep as an invariant/safety check.

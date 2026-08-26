@@ -31,14 +31,14 @@ filters:
 
   # Stricter English-confidence filter while preserving
   # technical and educational content.
-  min_language_score: 0.93
+  min_language_score: 0.95
 
   # FineWeb-Edu educational-quality threshold.
   min_int_score: 3
 
   # Remove very short web documents while preserving
   # useful medium-length educational pages.
-  min_token_count: 512
+  min_token_count: 256
 
   # Outlier / corruption guards.
   max_words: 50000

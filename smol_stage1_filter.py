@@ -384,6 +384,9 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_config(args.config)
     if int(cfg.get("stage", -1)) != 1:
         raise ValueError("Stage-1 config must contain stage: 1")
+    if cfg.get("enabled", True) is False:
+        reason = cfg.get("disabled_reason", "This source needs a dedicated processing path.")
+        raise RuntimeError(f"Stage-1 config {cfg.get('name', args.config)!r} is disabled: {reason}")
     if args.workers < 1:
         raise ValueError("--workers must be positive")
     token = hf_token()

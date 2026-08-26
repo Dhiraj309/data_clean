@@ -39,6 +39,8 @@ OUTPUT_SCHEMA = pa.schema(
         ("language_score", pa.float64()),
         ("fasttext_score", pa.float64()),
         ("score", pa.float64()),
+        ("answer_count", pa.int64()),
+        ("accepted_answer_id", pa.string()),
         ("int_score", pa.int64()),
         ("token_count", pa.int64()),
         ("word_count", pa.int64()),
@@ -247,6 +249,10 @@ def normalize_row(row: dict[str, Any], cfg: dict[str, Any], source_name: str) ->
         "language_score": as_float(get_path(row, columns.get("language_score", "language_score"))),
         "fasttext_score": as_float(get_path(row, columns.get("fasttext_score", "fasttext_score"))),
         "score": as_float(get_path(row, columns.get("score", "score"))),
+        "answer_count": as_int(get_path(row, columns.get("answer_count", "answer_count"))),
+        "accepted_answer_id": as_string(
+            get_path(row, columns.get("accepted_answer_id", "accepted_answer_id"))
+        ),
         "int_score": as_int(get_path(row, columns.get("int_score", "int_score"))),
         "token_count": raw_token_count,
         "word_count": word_count,
@@ -281,6 +287,7 @@ def accepts(row: dict[str, Any], filters: dict[str, Any]) -> tuple[bool, str | N
         ("language_score", "min_language_score"),
         ("fasttext_score", "min_fasttext_score"),
         ("score", "min_score"),
+        ("answer_count", "min_answer_count"),
         ("int_score", "min_int_score"),
         ("token_count", "min_token_count"),
         ("estimated_tokens", "min_estimated_tokens"),
