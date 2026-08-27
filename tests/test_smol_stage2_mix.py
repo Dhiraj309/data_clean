@@ -5,7 +5,17 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from smol_stage2_mix import OutputShardWriter, choose_source_by_token_debt
+from smol_stage2_mix import OutputShardWriter, choose_source_by_token_debt, make_resource_plan
+
+
+def test_resource_plan_scales_without_oversubscribing() -> None:
+    small = make_resource_plan(cpu_count=4)
+    large = make_resource_plan(cpu_count=224)
+    assert small.cpu_workers == 2
+    assert small.download_workers == 1
+    assert large.cpu_workers == 64
+    assert large.download_workers == 24
+    assert large.upload_workers == 1
 
 
 def test_token_debt_prefers_source_below_target() -> None:

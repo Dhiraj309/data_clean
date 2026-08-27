@@ -15,6 +15,8 @@ import json
 import os
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
 from rich.console import Console, Group
@@ -41,6 +44,31 @@ from smol_pipeline import (
 
 
 MIXER_VERSION = 2
+
+
+@dataclass(frozen=True)
+class ResourcePlan:
+    """Safe defaults that scale with the host without oversubscribing it."""
+
+    cpu_workers: int
+    download_workers: int
+    upload_workers: int
+
+
+def make_resource_plan(
+    cpu_count: int | None = None,
+    cpu_workers: int | None = None,
+    download_workers: int | None = None,
+    upload_workers: int | None = None,
+) -> ResourcePlan:
+    cpus = max(1, int(cpu_count or (os.cpu_count() or 1)))
+    return ResourcePlan(
+        cpu_workers=max(1, min(int(cpu_workers or max(1, cpus - 2)), 64)),
+        download_workers=max(1, min(int(download_workers or max(1, cpus // 8)), 24)),
+        # Hub commits are ordered and should remain single-flight. This is
+        # intentionally capped at one even on very large machines.
+        upload_workers=1 if upload_workers is None else max(1, min(int(upload_workers), 1)),
+    )
 
 
 def empty_state(
@@ -152,6 +180,53 @@ def _source_manifest(
     return revision, files
 
 
+class ShardPrefetcher:
+    """Bounded background downloader for current/next source shards."""
+
+    def __init__(self, workers: int) -> None:
+        self.executor = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+        self.futures: dict[tuple[str, int], Future[str]] = {}
+
+    def submit(
+        self,
+        source: dict[str, Any],
+        revision: str,
+        filename: str,
+        file_index: int,
+        token: str,
+        local_dir: Path,
+    ) -> None:
+        key = (str(source["name"]), int(file_index))
+        if key in self.futures:
+            return
+        local_dir.mkdir(parents=True, exist_ok=True)
+        self.futures[key] = self.executor.submit(
+            hf_hub_download,
+            repo_id=source["repo_id"],
+            filename=filename,
+            repo_type="dataset",
+            revision=revision,
+            token=token,
+            local_dir=str(local_dir),
+        )
+
+    def take(
+        self,
+        source: dict[str, Any],
+        revision: str,
+        filename: str,
+        file_index: int,
+        token: str,
+        local_dir: Path,
+    ) -> Path:
+        key = (str(source["name"]), int(file_index))
+        self.submit(source, revision, filename, file_index, token, local_dir)
+        return Path(self.futures.pop(key).result())
+
+    def close(self) -> None:
+        self.executor.shutdown(wait=True, cancel_futures=False)
+
+
 class SourceCursor:
     """One lazy local Parquet shard and a resumable row cursor."""
 
@@ -164,11 +239,13 @@ class SourceCursor:
         local_root: Path,
         state: dict[str, Any],
         batch_rows: int,
+        prefetcher: ShardPrefetcher,
     ) -> None:
         self.source = source
         self.revision = revision
         self.files = files
         self.token = token
+        self.prefetcher = prefetcher
         self.local_dir = local_root / source["name"]
         self.local_dir.mkdir(parents=True, exist_ok=True)
         self.file_index = int(state.get("file_index", 0))
@@ -180,6 +257,7 @@ class SourceCursor:
         self._local_path: Path | None = None
         self._parquet: pq.ParquetFile | None = None
         self._batches = None
+        self._arrow_batch: pa.RecordBatch | None = None
         self._row_buffer: deque[dict[str, Any]] = deque()
         self._open_position()
 
@@ -192,17 +270,18 @@ class SourceCursor:
             self.exhausted = True
             return
         remote_name = self.files[self.file_index]
-        downloaded = hf_hub_download(
-            repo_id=self.source["repo_id"],
-            filename=remote_name,
-            repo_type="dataset",
-            revision=self.revision,
-            token=self.token,
-            local_dir=str(self.local_dir),
+        downloaded = self.prefetcher.take(
+            self.source,
+            self.revision,
+            remote_name,
+            self.file_index,
+            self.token,
+            self.local_dir,
         )
-        self._local_path = Path(downloaded)
+        self._local_path = downloaded
         self._parquet = pq.ParquetFile(self._local_path)
         self._batches = iter(self._parquet.iter_batches(batch_size=self.batch_rows))
+        self._arrow_batch = None
         self._row_buffer.clear()
 
         # Resume at a row offset without loading the whole shard. The offset
@@ -217,13 +296,14 @@ class SourceCursor:
             if remaining >= batch.num_rows:
                 remaining -= batch.num_rows
                 continue
-            self._row_buffer.extend(batch.slice(remaining).to_pylist())
+            self._arrow_batch = batch.slice(remaining)
             remaining = 0
 
     def _advance_file(self) -> None:
         old_path = self._local_path
         self._parquet = None
         self._batches = None
+        self._arrow_batch = None
         self._row_buffer.clear()
         self._local_path = None
         if old_path is not None:
@@ -246,12 +326,55 @@ class SourceCursor:
                 self._advance_file()
         return bool(self._row_buffer)
 
+    def next_batch(self, max_rows: int | None = None) -> pa.RecordBatch | None:
+        """Return one Arrow batch and advance the resumable row cursor."""
+        while not self.exhausted:
+            if self._arrow_batch is not None:
+                batch = self._arrow_batch
+                self._arrow_batch = None
+            elif self._batches is not None:
+                try:
+                    batch = next(self._batches)
+                except StopIteration:
+                    self._advance_file()
+                    continue
+            else:
+                self.exhausted = True
+                break
+            if batch.num_rows == 0:
+                continue
+            if max_rows is not None and batch.num_rows > max_rows:
+                self._arrow_batch = batch.slice(max_rows)
+                batch = batch.slice(0, max_rows)
+            self.row_offset += batch.num_rows
+            self.rows += batch.num_rows
+            self._maybe_prefetch_next()
+            return batch
+        return None
+
+    def _maybe_prefetch_next(self) -> None:
+        if self.exhausted or self._parquet is None:
+            return
+        if self.file_index + 1 >= len(self.files):
+            return
+        if self.row_offset < max(0, self._parquet.metadata.num_rows - 2 * self.batch_rows):
+            return
+        self.prefetcher.submit(
+            self.source,
+            self.revision,
+            self.files[self.file_index + 1],
+            self.file_index + 1,
+            self.token,
+            self.local_dir,
+        )
+
     def __next__(self) -> dict[str, Any]:
         if not self._next_batch():
             raise StopIteration
         row = self._row_buffer.popleft()
         self.row_offset += 1
         self.rows += 1
+        self._maybe_prefetch_next()
         return row
 
     def add_tokens(self, tokens: int) -> None:
@@ -273,6 +396,7 @@ class SourceCursor:
         path = self._local_path
         self._parquet = None
         self._batches = None
+        self._arrow_batch = None
         self._row_buffer.clear()
         self._local_path = None
         if remove_current and path is not None:
@@ -311,11 +435,29 @@ class OutputShardWriter:
                 self.path,
                 OUTPUT_SCHEMA,
                 compression="zstd",
-                compression_level=6,
+                compression_level=3,
             )
         self._writer.write_table(table)
         self.documents += len(self._rows)
         self._rows.clear()
+
+    def add_table(self, table: pa.Table) -> Path | None:
+        """Write a complete Arrow table without converting rows to Python."""
+        if table.num_rows == 0:
+            return None
+        self._flush_batch()
+        if self._writer is None:
+            self._writer = pq.ParquetWriter(
+                self.path,
+                OUTPUT_SCHEMA,
+                compression="zstd",
+                compression_level=3,
+            )
+        self._writer.write_table(table)
+        self.documents += table.num_rows
+        if self.documents >= self.max_documents or self.path.stat().st_size >= self.target_bytes:
+            return self.close()
+        return None
 
     def add(self, row: dict[str, Any]) -> Path | None:
         self._rows.append(row)
@@ -428,6 +570,62 @@ def _tokens_for_row(row: dict[str, Any]) -> int:
     return max(1, int(round(len(str(row.get("text", "")).split()) * 1.3)))
 
 
+def _prepare_output_batch(
+    batch: pa.RecordBatch,
+    source: dict[str, Any],
+    mix_name: str,
+    total_weight: float,
+) -> pa.Table:
+    """Project one Stage-1 Arrow batch to the stable Stage-2 schema."""
+    table = pa.Table.from_batches([batch])
+    arrays = []
+    for field in OUTPUT_SCHEMA:
+        if field.name in table.column_names:
+            array = table[field.name].combine_chunks()
+            if array.type != field.type:
+                array = pc.cast(array, field.type, safe=False)
+        else:
+            array = pa.nulls(table.num_rows, type=field.type)
+        arrays.append(array)
+    output = pa.Table.from_arrays(arrays, schema=OUTPUT_SCHEMA)
+    output = output.set_column(
+        output.schema.get_field_index("source_name"),
+        "source_name",
+        pa.array([source["name"]] * output.num_rows, type=pa.string()),
+    )
+    output = output.set_column(
+        output.schema.get_field_index("mix_name"),
+        "mix_name",
+        pa.array([mix_name] * output.num_rows, type=pa.string()),
+    )
+    output = output.set_column(
+        output.schema.get_field_index("mix_weight"),
+        "mix_weight",
+        pa.array(
+            [float(source["weight"]) / total_weight] * output.num_rows,
+            type=pa.float64(),
+        ),
+    )
+    return output
+
+
+def _batch_token_count(batch: pa.RecordBatch) -> int:
+    """Sum Stage-1 token metadata in Arrow; fall back only for malformed rows."""
+    names = set(batch.schema.names)
+    for column_name in ("estimated_tokens", "token_count"):
+        if column_name not in names:
+            continue
+        values = batch.column(batch.schema.get_field_index(column_name))
+        try:
+            values = pc.cast(values, pa.int64(), safe=False)
+            total = pc.sum(values).as_py()
+            if total is not None:
+                return max(1, int(total))
+        except (TypeError, ValueError, pa.ArrowInvalid):
+            pass
+    return sum(_tokens_for_row(row) for row in batch.to_pylist())
+
+
 def _commit_output_shard(
     api: HfApi,
     repo_id: str,
@@ -475,6 +673,60 @@ def _existing_output_parts(
     )
 
 
+class UploadPipeline:
+    """Overlap processing with one ordered Hub commit at a time."""
+
+    def __init__(self, workers: int) -> None:
+        # Multiple concurrent create_commit calls can race on main. Keep the
+        # commit stream ordered while allowing the caller to continue writing
+        # the next output shard during the upload.
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.pending: deque[tuple[Future[None], Path, Path, str, int]] = deque()
+        self.workers = max(1, int(workers))
+
+    def submit(
+        self,
+        api: HfApi,
+        repo_id: str,
+        token: str,
+        output_path: Path,
+        remote_part: str,
+        checkpoint_path: Path,
+        remote_state: str,
+        output_progress: str,
+        state_after: dict[str, Any],
+    ) -> None:
+        if self.pending:
+            self.wait_one()
+        future = self.executor.submit(
+            _commit_output_shard,
+            api,
+            repo_id,
+            token,
+            output_path,
+            remote_part,
+            checkpoint_path,
+            remote_state,
+            output_progress,
+            state_after,
+        )
+        self.pending.append(
+            (future, output_path, checkpoint_path, remote_part, int(state_after["last_part_bytes"]))
+        )
+
+    def wait_one(self) -> None:
+        future, output_path, checkpoint_path, remote_part, size_bytes = self.pending.popleft()
+        future.result()
+        output_path.unlink(missing_ok=True)
+        checkpoint_path.unlink(missing_ok=True)
+        print(f"Pushed {remote_part} ({size_bytes / 1024**2:.1f} MiB)", flush=True)
+
+    def wait_all(self) -> None:
+        while self.pending:
+            self.wait_one()
+        self.executor.shutdown(wait=True, cancel_futures=False)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -483,6 +735,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--run-id", default=None, help="Override config run_id, useful for smoke tests")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--auto-workers", action="store_true", help="Use hardware-adaptive worker defaults")
+    parser.add_argument("--compute-workers", type=int, default=None)
+    parser.add_argument("--download-workers", type=int, default=None)
+    parser.add_argument("--upload-workers", type=int, default=None)
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -506,6 +762,11 @@ def main(argv: list[str] | None = None) -> None:
     output = cfg["output"]
     console = Console()
     target_tokens = args.target_tokens or cfg.get("target_tokens")
+    resource_plan = make_resource_plan(
+        cpu_workers=args.compute_workers,
+        download_workers=args.download_workers,
+        upload_workers=args.upload_workers,
+    )
 
     if args.dry_run:
         plan = Table(expand=True, box=None, padding=(0, 1))
@@ -575,6 +836,24 @@ def main(argv: list[str] | None = None) -> None:
     estimated_tokens = int(state.get("estimated_tokens", 0))
     rows_by_source = dict(state.get("rows_by_source", {}))
     tokens_by_source = dict(state.get("tokens_by_source", {}))
+    if hasattr(pa, "set_cpu_count"):
+        pa.set_cpu_count(resource_plan.cpu_workers)
+    if hasattr(pa, "set_io_thread_count"):
+        pa.set_io_thread_count(max(1, min(resource_plan.cpu_workers, 32)))
+    prefetcher = ShardPrefetcher(resource_plan.download_workers)
+    for source in sources:
+        name = source["name"]
+        cursor_state = state.get("source_cursors", {}).get(name, {})
+        file_index = int(cursor_state.get("file_index", 0))
+        if not bool(cursor_state.get("exhausted", False)) and file_index < len(source_files[name]):
+            prefetcher.submit(
+                source,
+                source_revisions[name],
+                source_files[name][file_index],
+                file_index,
+                token,
+                local_root / "sources" / name,
+            )
     cursors = {
         source["name"]: SourceCursor(
             source,
@@ -584,6 +863,7 @@ def main(argv: list[str] | None = None) -> None:
             local_root / "sources",
             state.get("source_cursors", {}).get(source["name"], {}),
             int(output.get("buffer_batch_rows", 4096)),
+            prefetcher,
         )
         for source in sources
     }
@@ -595,7 +875,9 @@ def main(argv: list[str] | None = None) -> None:
         int(output.get("buffer_batch_rows", 4096)),
         int(output.get("max_documents", 1_000_000)),
     )
-    checkpoint_path = local_root / "checkpoint.next.json"
+    checkpoint_dir = local_root / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    upload_pipeline = UploadPipeline(resource_plan.upload_workers)
     started = time.perf_counter()
     live = Live(
         mix_status_panel(sources, rows_by_source, tokens_by_source, rows, estimated_tokens,
@@ -630,17 +912,20 @@ def main(argv: list[str] | None = None) -> None:
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
         remote_part = f"{output_prefix}/{filename_prefix}_shard_{next_part:05d}.parquet"
-        _commit_output_shard(
-            api, output["repo_id"], token, path, remote_part, checkpoint_path,
-            remote_state, f"{output_prefix}/progress.json", state_after,
+        checkpoint_path = checkpoint_dir / f"state-{next_part:05d}.json"
+        upload_pipeline.submit(
+            api,
+            output["repo_id"],
+            token,
+            path,
+            remote_part,
+            checkpoint_path,
+            remote_state,
+            f"{output_prefix}/progress.json",
+            state_after,
         )
         write_json(local_state, state_after)
-        path.unlink(missing_ok=True)
-        checkpoint_path.unlink(missing_ok=True)
         state = state_after
-        console.print(
-            f"[green]Pushed[/green] {remote_part} ({state_after['last_part_bytes'] / 1024**2:.1f} MiB)"
-        )
 
     try:
         last_status = started
@@ -667,24 +952,30 @@ def main(argv: list[str] | None = None) -> None:
 
             name = source["name"]
             try:
-                row = dict(next(cursors[name]))
+                remaining_rows = None
+                if args.limit_rows is not None:
+                    remaining_rows = max(1, int(args.limit_rows) - rows)
+                batch = cursors[name].next_batch(remaining_rows)
             except StopIteration:
                 exhausted.add(name)
                 continue
-            tokens = _tokens_for_row(row)
-            row["source_name"] = name
-            row["mix_name"] = cfg.get("name", "smol_mix")
-            row["mix_weight"] = float(source["weight"]) / total_weight
-            row["estimated_tokens"] = tokens
+            if batch is None:
+                exhausted.add(name)
+                continue
+            tokens = _batch_token_count(batch)
+            batch_table = _prepare_output_batch(
+                batch, source, cfg.get("name", "smol_mix"), total_weight
+            )
             estimated_tokens += tokens
-            rows += 1
-            rows_by_source[name] = int(rows_by_source.get(name, 0)) + 1
+            batch_rows = int(batch.num_rows)
+            rows += batch_rows
+            rows_by_source[name] = int(rows_by_source.get(name, 0)) + batch_rows
             tokens_by_source[name] = int(tokens_by_source.get(name, 0)) + tokens
             cursors[name].add_tokens(tokens)
-            part = output_writer.add(row)
+            part = output_writer.add_table(batch_table)
 
             now = time.perf_counter()
-            if rows % 2048 == 0 or now - last_status >= 1.0:
+            if rows % max(2048, int(output.get("buffer_batch_rows", 4096))) == 0 or now - last_status >= 1.0:
                 live.update(
                     mix_status_panel(sources, rows_by_source, tokens_by_source, rows,
                                      estimated_tokens, target_tokens, name, "mixing")
@@ -696,6 +987,7 @@ def main(argv: list[str] | None = None) -> None:
         part = output_writer.close()
         if part is not None:
             commit_output(part)
+        upload_pipeline.wait_all()
 
         completed = (
             args.limit_rows is None
@@ -715,6 +1007,7 @@ def main(argv: list[str] | None = None) -> None:
         if completed:
             # No output shard may exist when a tiny run has zero rows. Publish
             # the terminal state separately in that case.
+            checkpoint_path = local_root / "checkpoint-final.json"
             write_json(checkpoint_path, state)
             api.create_commit(
                 repo_id=output["repo_id"],
@@ -739,6 +1032,9 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         for cursor in cursors.values():
             cursor.close(remove_current=False)
+        if upload_pipeline.pending:
+            upload_pipeline.wait_all()
+        prefetcher.close()
         live.stop()
 
     console.print(
