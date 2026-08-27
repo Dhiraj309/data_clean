@@ -1,0 +1,36 @@
+stage: 3
+name: laughlm-v1-tokenized
+
+# Stage 3 consumes the completed Stage-2 mixed Parquet corpus.
+source:
+  repo_id: "dignity045/laughlm-smol-v1-training"
+  revision: "main"
+  split: "train"
+  path_prefix: "train"
+  file_pattern: "*.parquet"
+  progress_file: "progress.json"
+  filename_prefix: "laughlm-v1"
+  text_column: "text"
+
+tokenizer:
+  # This must be the exact tokenizer used by LaughLM training.
+  id: "microsoft/Phi-3.5-mini-instruct"
+  max_doc_tokens: 8192
+  hard_doc_limit: 65536
+
+output:
+  repo_id: "LaughTaleAI/LaughLM-Tokenized-Fine"
+  private: true
+  run_id: "v1"
+  path_prefix: "laughlm-v1"
+  filename_prefix: "laughlm-v1"
+
+  # Binary shards contain exactly this many tokens, except the final buffer.
+  shard_size_tokens: 250000000
+  batch_size: 10000
+  io_chunk_tokens: 8388608
+
+  # Upload buffer/progress together every N completed source files.
+  # Local state is written after each token chunk for persistent-disk resume.
+  remote_checkpoint_every_files: 5
+  local_dir: "work/smol_stage3"
