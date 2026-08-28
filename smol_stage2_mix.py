@@ -584,15 +584,18 @@ def load_state(
                 f"Stage-1 source {name!r} was removed, reordered, or changed; "
                 "use a new run_id."
             )
-        if len(current) == len(previous):
-            if saved_revisions.get(name) != source_revisions.get(name):
-                raise RuntimeError(
-                    f"Stage-1 source revision changed for {name!r}; use a new run_id."
-                )
-        else:
+        if len(current) > len(previous):
             extended = True
 
-    if not extended:
+    # A shared Stage-1 repository receives commits for all domains. Its
+    # revision can therefore advance even when this source has no new files.
+    # The immutable, ordered file list is the relevant source-level contract.
+    manifest_changed = any(
+        list(saved_files[name]) != list(source_files[name])
+        or saved_revisions.get(name) != source_revisions.get(name)
+        for name in saved_files
+    )
+    if not extended and not manifest_changed:
         raise RuntimeError("Stage-1 source manifest differs from the saved checkpoint")
 
     resumed = copy.deepcopy(candidate)
