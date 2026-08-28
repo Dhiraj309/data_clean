@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
+import smol_stage2_mix as stage2
 from smol_stage2_mix import OutputShardWriter, choose_source_by_token_debt, make_resource_plan
 
 
@@ -70,3 +72,105 @@ def test_output_writer_rotates_by_compressed_file_size(tmp_path: Path) -> None:
     assert part.name == "part-00000.parquet"
     assert pq.ParquetFile(part).metadata.num_rows == 2
     assert pa.parquet.ParquetFile(part).metadata.num_rows == 2
+
+
+def test_unfinished_state_accepts_append_only_source_extension(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = {"stage": 2, "name": "fixture", "seed": 42}
+    sources = [{"name": "general", "weight": 1.0}]
+    saved_revisions = {"general": "old-revision"}
+    saved_files = {"general": ["general/shard_00000.parquet"]}
+    saved_hash = stage2.stable_id({
+        "mixer_version": stage2.MIXER_VERSION,
+        "config": config,
+        "source_revisions": saved_revisions,
+        "source_files": saved_files,
+    })
+    candidate = {
+        "mixer_version": stage2.MIXER_VERSION,
+        "config_hash": saved_hash,
+        "source_revisions": saved_revisions,
+        "source_files": saved_files,
+        "source_cursors": {
+            "general": {
+                "file_index": 1,
+                "row_offset": 0,
+                "exhausted": True,
+            }
+        },
+    }
+    monkeypatch.setattr(stage2, "download_json_if_present", lambda *args: candidate)
+    current_revisions = {"general": "new-revision"}
+    current_files = {
+        "general": [
+            "general/shard_00000.parquet",
+            "general/shard_00001.parquet",
+        ]
+    }
+    current_hash = stage2.stable_id({
+        "mixer_version": stage2.MIXER_VERSION,
+        "config": config,
+        "source_revisions": current_revisions,
+        "source_files": current_files,
+    })
+
+    state = stage2.load_state(
+        tmp_path / "state.json",
+        "fixture/repo",
+        "checkpoint.json",
+        "token",
+        sources,
+        config,
+        current_hash,
+        current_revisions,
+        current_files,
+    )
+
+    assert state["source_files"] == current_files
+    assert state["source_revisions"] == current_revisions
+    assert state["config_hash"] == current_hash
+    assert state["source_cursors"]["general"]["exhausted"] is False
+
+
+def test_state_rejects_reordered_source_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = {"stage": 2, "name": "fixture", "seed": 42}
+    sources = [{"name": "general", "weight": 1.0}]
+    saved_revisions = {"general": "old-revision"}
+    saved_files = {"general": ["general/shard_00000.parquet"]}
+    saved_hash = stage2.stable_id({
+        "mixer_version": stage2.MIXER_VERSION,
+        "config": config,
+        "source_revisions": saved_revisions,
+        "source_files": saved_files,
+    })
+    candidate = {
+        "mixer_version": stage2.MIXER_VERSION,
+        "config_hash": saved_hash,
+        "source_revisions": saved_revisions,
+        "source_files": saved_files,
+    }
+    monkeypatch.setattr(stage2, "download_json_if_present", lambda *args: candidate)
+    current_revisions = {"general": "new-revision"}
+    current_files = {"general": ["general/shard_00001.parquet"]}
+    current_hash = stage2.stable_id({
+        "mixer_version": stage2.MIXER_VERSION,
+        "config": config,
+        "source_revisions": current_revisions,
+        "source_files": current_files,
+    })
+
+    with pytest.raises(RuntimeError, match="removed, reordered, or changed"):
+        stage2.load_state(
+            tmp_path / "state.json",
+            "fixture/repo",
+            "checkpoint.json",
+            "token",
+            sources,
+            config,
+            current_hash,
+            current_revisions,
+            current_files,
+        )

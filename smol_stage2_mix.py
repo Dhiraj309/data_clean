@@ -535,6 +535,7 @@ def load_state(
     remote_state: str,
     token: str,
     sources: list[dict[str, Any]],
+    config: dict[str, Any],
     config_hash: str,
     source_revisions: dict[str, str],
     source_files: dict[str, list[str]],
@@ -550,13 +551,63 @@ def load_state(
             "Existing Stage-2 state uses an older mixer. Use a new run_id or "
             "remove the old Stage-2 output before restarting."
         )
-    if candidate.get("config_hash") != config_hash:
-        raise RuntimeError("Stage-2 config/source manifest differs from the saved checkpoint")
-    if candidate.get("source_revisions") != source_revisions:
-        raise RuntimeError("Stage-1 source revisions differ from the saved checkpoint")
-    if candidate.get("source_files") != source_files:
-        raise RuntimeError("Stage-1 source file manifest differs from the saved checkpoint")
-    return candidate
+
+    saved_revisions = candidate.get("source_revisions") or {}
+    saved_files = candidate.get("source_files") or {}
+    saved_hash = stable_id({
+        "mixer_version": MIXER_VERSION,
+        "config": config,
+        "source_revisions": saved_revisions,
+        "source_files": saved_files,
+    })
+    if candidate.get("config_hash") != saved_hash:
+        raise RuntimeError(
+            "Stage-2 configuration differs from the saved checkpoint. "
+            "Use the original configuration or a new run_id."
+        )
+
+    if candidate.get("config_hash") == config_hash:
+        return candidate
+
+    # Stage-1 is append-only: completed shards are immutable and new shards
+    # are added at the end. This lets an unfinished Stage-2 run resume after
+    # a source has been extended, without replaying any mixed output.
+    extended = False
+    for source in sources:
+        name = str(source["name"])
+        previous = list(saved_files.get(name, []))
+        current = list(source_files.get(name, []))
+        if name not in saved_files or name not in source_files:
+            raise RuntimeError("Stage-1 source manifest differs from the saved checkpoint")
+        if current[: len(previous)] != previous:
+            raise RuntimeError(
+                f"Stage-1 source {name!r} was removed, reordered, or changed; "
+                "use a new run_id."
+            )
+        if len(current) == len(previous):
+            if saved_revisions.get(name) != source_revisions.get(name):
+                raise RuntimeError(
+                    f"Stage-1 source revision changed for {name!r}; use a new run_id."
+                )
+        else:
+            extended = True
+
+    if not extended:
+        raise RuntimeError("Stage-1 source manifest differs from the saved checkpoint")
+
+    resumed = copy.deepcopy(candidate)
+    resumed["source_revisions"] = source_revisions
+    resumed["source_files"] = source_files
+    resumed["config_hash"] = config_hash
+    resumed["manifest_extended"] = True
+    for source in sources:
+        name = str(source["name"])
+        cursor = resumed.get("source_cursors", {}).get(name)
+        if not isinstance(cursor, dict):
+            continue
+        if bool(cursor.get("exhausted", False)) and int(cursor.get("file_index", 0)) < len(source_files[name]):
+            cursor["exhausted"] = False
+    return resumed
 
 
 def _tokens_for_row(row: dict[str, Any]) -> int:
@@ -826,7 +877,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
         state = load_state(
             local_state, output["repo_id"], remote_state, token, sources,
-            config_hash, source_revisions, source_files,
+            cfg, config_hash, source_revisions, source_files,
         )
     if state.get("finished"):
         console.print("[dim]Stage 2 is already complete; nothing to process.[/dim]")
