@@ -1,0 +1,42 @@
+stage: 1
+name: infimm_webmath
+
+source:
+  repo_id: "HuggingFaceTB/finemath"
+  config: "infiwebmath-3plus"
+  revision: "main"
+  split: "train"
+  path_prefix: "infiwebmath-3plus"
+  file_pattern: "*.parquet"
+
+columns:
+  text: text
+  url: url
+  token_count: token_count
+  score: score
+  int_score: int_score
+  dataset: dataset
+
+required_columns:
+  - text
+  - token_count
+  - int_score
+
+filters:
+  min_int_score: 3
+  min_token_count: 256
+  max_words: 25000
+  max_chars: 150000
+  missing_policy: reject
+
+output:
+  repo_id: "${FILTERED_REPO}"
+  domain: "infimm-webmath"
+  private: true
+  run_id: "v1"
+  path_prefix: ""
+  target_size_mb: 1024
+  staging_size_mb: 128
+  buffer_batch_rows: 4096
+  max_documents: 1000000
+  local_dir: "work/smol_stage1"
