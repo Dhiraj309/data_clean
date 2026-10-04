@@ -1,0 +1,76 @@
+stage: 2
+name: laughlm-135m-deep-narrow-v2
+seed: 42
+
+# Foundation mixture for a SmolLM2-135M-style deep/narrow base model.
+#
+# Target pilot:
+# DCLM 55.0%
+# FineWeb-Edu 35.0%
+# Stack-Edu 6.0%
+# FineMath 2.0%
+# Cosmopedia 1.5%
+# InfiMM-WebMath 0.5%
+
+target_tokens: 20000000000
+
+sources:
+  - name: dclm
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: dclm
+    filename_prefix: dclm
+    progress_file: progress.json
+    weight: 0.55
+
+  - name: fineweb_edu
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: fineweb-edu
+    filename_prefix: fineweb-edu
+    progress_file: progress.json
+    weight: 0.35
+
+  - name: stack_edu
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: stack-edu
+    filename_prefix: stack-edu
+    progress_file: progress.json
+    weight: 0.06
+
+  - name: finemath
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: finemath-4plus
+    filename_prefix: finemath-4plus
+    progress_file: progress.json
+    weight: 0.02
+
+  - name: cosmopedia_v2
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: cosmopedia-v2
+    filename_prefix: cosmopedia-v2
+    progress_file: progress.json
+    weight: 0.015
+
+  - name: infimm_webmath
+    repo_id: "${FILTERED_REPO}"
+    revision: main
+    path_prefix: infimm-webmath
+    filename_prefix: infimm-webmath
+    progress_file: progress.json
+    weight: 0.005
+
+output:
+  repo_id: "${HF_USER}/laughlm-135m-deep-narrow-v2-training"
+  private: true
+  run_id: v2
+  path_prefix: train
+  filename_prefix: laughlm-135m-v2
+  target_size_mb: 1024
+  staging_size_mb: 128
+  buffer_batch_rows: 4096
+  max_documents: 1000000
+  local_dir: work/laughlm_stage2
